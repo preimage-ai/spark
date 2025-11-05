@@ -64,6 +64,8 @@ void main() {
         rgba *= modulate;
     }
 
+    // rgba.a *= 1.0 - mix(1.0, exp(-0.5 * z), falloff);
+    // rgba.a = 1.0;
     rgba.a *= mix(1.0, exp(-0.5 * z), falloff);
 
     if (rgba.a < minAlpha) {

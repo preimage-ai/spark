@@ -42,6 +42,22 @@ uniform vec4 rgbMinMaxLnScaleMinMax;
     }
 #endif
 
+// Compute the 6 sigma points of a 3D gaussian
+void computeSplatSigmaPoints(vec3 center, vec3 scales, vec4 quaternion, float multiplier, out vec3 sigmaPts[6]) {
+    vec3 axes[3] = vec3[3](
+        quatVec(quaternion, vec3(1.0, 0.0, 0.0)),
+        quatVec(quaternion, vec3(0.0, 1.0, 0.0)),
+        quatVec(quaternion, vec3(0.0, 0.0, 1.0))
+    );
+    vec3 sqrtScales = scales * multiplier; 
+    sigmaPts[0] = center + axes[0] * sqrtScales.x;
+    sigmaPts[1] = center - axes[0] * sqrtScales.x;
+    sigmaPts[2] = center + axes[1] * sqrtScales.y;
+    sigmaPts[3] = center - axes[1] * sqrtScales.y;
+    sigmaPts[4] = center + axes[2] * sqrtScales.z;
+    sigmaPts[5] = center - axes[2] * sqrtScales.z;
+}
+
 void main() {
     // Default to outside the frustum so it's discarded if we return early
     gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
@@ -73,6 +89,15 @@ void main() {
     vec3 center, scales;
     vec4 quaternion, rgba;
     unpackSplatEncoding(packed, center, scales, quaternion, rgba, rgbMinMaxLnScaleMinMax);
+    vec3 sigmaPts[6];
+
+    // Reference: "3DGUT: Enabling Distorted Cameras and Secondary Rays in Gaussian Splatting"
+    float spreadFac = 0.2;
+    float kappa = 0.0;
+    float beta = 2.0;
+    float lambda = spreadFac * spreadFac * (3.0 + kappa) - 3.0;
+    float multiplier = sqrt(3.0 + lambda);
+    computeSplatSigmaPoints(center, scales, quaternion, multiplier, sigmaPts);
 
     if (rgba.a < minAlpha) {
         return;
@@ -84,6 +109,12 @@ void main() {
 
     // Compute the view space center of the splat
     vec3 viewCenter = quatVec(renderToViewQuat, center) + renderToViewPos;
+
+    // Compute the view space sigma points of the splat
+    vec3 viewSigmaPts[6];
+    for (int i = 0; i < 6; ++i) {
+        viewSigmaPts[i] = quatVec(renderToViewQuat, sigmaPts[i]) + renderToViewPos;
+    }
 
     // Discard splats behind the camera
     if (viewCenter.z >= 0.0) {
@@ -131,6 +162,28 @@ void main() {
 
     // Compute NDC center of the splat
     vec3 ndcCenter = clipCenter.xyz / clipCenter.w;
+    
+    // Compute the NDC space sigma points of the splat
+    vec4 ndcSigmaPts[6];
+    for (int i = 0; i < 6; ++i) {
+        vec4 clipSigmaPt = projectionMatrix * vec4(viewSigmaPts[i], 1.0);
+        ndcSigmaPts[i] = clipSigmaPt / clipSigmaPt.w;
+    }
+
+    float centerWeight = lambda / (3.0 + lambda);
+    float centerWeightCov = centerWeight + 1.0 - spreadFac * spreadFac + beta;
+    float sigmaWeight = 1.0  / (2.0 * (3.0 + lambda));
+
+    vec2 ndcMean = ndcCenter.xy * centerWeight;
+    for (int i = 0; i < 6; ++i) {
+        ndcMean += ndcSigmaPts[i].xy * sigmaWeight;
+    }
+    mat2 estCov2D = mat2(0.0, 0.0, 0.0, 0.0);
+    estCov2D += centerWeightCov * outerProduct(ndcCenter.xy - ndcMean, ndcCenter.xy - ndcMean);
+
+    for (int i = 0; i < 6; ++i) {
+        estCov2D += sigmaWeight * outerProduct(ndcSigmaPts[i].xy - ndcMean, ndcSigmaPts[i].xy - ndcMean);
+    }
 
     // Compute the 3D covariance matrix of the splat
     mat3 RS = scaleQuaternionToMatrix(scales, viewQuaternion);
@@ -158,6 +211,10 @@ void main() {
         );
     }
 
+    vec2 ndcToPixelScale = 0.5 * scaledRenderSize; // scaledRenderSize = renderSize * focalAdjustment
+    mat2 scaleMatrix = mat2(ndcToPixelScale.x, 0.0, 0.0, ndcToPixelScale.y);
+    mat2 estCov2DPixelSpace = scaleMatrix * estCov2D * transpose(scaleMatrix);
+
     // Compute the 2D covariance by projecting the 3D covariance
     // and picking out the XY plane components.
     // Keeping below because we may need it in the future
@@ -165,7 +222,8 @@ void main() {
     // mat3 W = transpose(mat3(viewMatrix));
     // mat3 T = W * J;
     // mat3 cov2D = transpose(T) * cov3D * T;
-    mat3 cov2D = transpose(J) * cov3D * J;
+    // mat3 cov2D = transpose(J) * cov3D * J;
+    mat2 cov2D = estCov2DPixelSpace;
     float a = cov2D[0][0];
     float d = cov2D[1][1];
     float b = cov2D[0][1];
