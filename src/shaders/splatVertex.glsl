@@ -13,6 +13,12 @@ out vec2 vSplatUv;
 out vec3 vNdc;
 flat out uint vSplatIndex;
 
+flat out mat3 vInvRS;   // (R*S)^-1 = S^-1 * R^T  (maps view->splat)
+flat out mat3 vRS;      // R*S (maps splat->view), used if you want closest-point depth/tex
+flat out vec3 vMu;      // view-space center μ
+flat out vec2 vInvFocal;// (1/px, 1/py) with px=projectionMatrix[0][0], py=projectionMatrix[1][1]
+flat out vec2 vScaledRenderSize; // same scaledRenderSize you used for bounds
+
 uniform vec2 renderSize;
 uniform uint numSplats;
 uniform vec4 renderToViewQuat;
@@ -129,12 +135,6 @@ void main() {
         return;
     }
 
-    // Discard splats more than clipXY times outside the XY frustum
-    float clip = clipXY * clipCenter.w;
-    if (abs(clipCenter.x) > clip || abs(clipCenter.y) > clip) {
-        return;
-    }
-
     // Record the splat index for entropy
     vSplatIndex = splatIndex;
 
@@ -163,11 +163,27 @@ void main() {
     // Compute NDC center of the splat
     vec3 ndcCenter = clipCenter.xyz / clipCenter.w;
     
+    bool allPointsOutside = true;
+
     // Compute the NDC space sigma points of the splat
     vec4 ndcSigmaPts[6];
     for (int i = 0; i < 6; ++i) {
         vec4 clipSigmaPt = projectionMatrix * vec4(viewSigmaPts[i], 1.0);
+        float clip = clipXY * clipSigmaPt.w;
+        if (abs(clipSigmaPt.x) <= clip && abs(clipSigmaPt.y) <= clip) {
+            allPointsOutside = false;
+        }
         ndcSigmaPts[i] = clipSigmaPt / clipSigmaPt.w;
+    }
+
+    // Discard splats more than clipXY times outside the XY frustum
+    float clip = clipXY * clipCenter.w;
+    if (abs(clipCenter.x) <= clip && abs(clipCenter.y) <= clip) {
+        allPointsOutside = false;
+    }
+
+    if (allPointsOutside) {
+        return;
     }
 
     float centerWeight = lambda / (3.0 + lambda);
@@ -187,10 +203,34 @@ void main() {
 
     // Compute the 3D covariance matrix of the splat
     mat3 RS = scaleQuaternionToMatrix(scales, viewQuaternion);
+    // Rotation (no scale)
+    mat3 R = scaleQuaternionToMatrix(vec3(1.0), viewQuaternion);
+
+    // Build S^-1 robustly (avoid div-by-zero for degenerate axes)
+    vec3 sInv = vec3(
+    (scales.x > 0.0) ? 1.0 / scales.x : 0.0,
+    (scales.y > 0.0) ? 1.0 / scales.y : 0.0,
+    (scales.z > 0.0) ? 1.0 / scales.z : 0.0
+    );
+    mat3 Sinv = mat3(
+    sInv.x, 0.0,   0.0,
+    0.0,   sInv.y, 0.0,
+    0.0,   0.0,   sInv.z
+    );
+
+    // (R*S) and its inverse without a general matrix inverse:
+    vRS     = RS;                 // = R * S
+    vInvRS  = Sinv * transpose(R);// = S^-1 * R^T
+    vMu     = viewCenter;
+
+    // For building rays in the fragment:
+    vec2 scaledRenderSize = renderSize * focalAdjustment;
+    vScaledRenderSize = scaledRenderSize;
+    vInvFocal = vec2(1.0 / projectionMatrix[0][0], 1.0 / projectionMatrix[1][1]);
+    
     mat3 cov3D = RS * transpose(RS);
 
     // Compute the Jacobian of the splat's projection at its center
-    vec2 scaledRenderSize = renderSize * focalAdjustment;
     vec2 focal = 0.5 * scaledRenderSize * vec2(projectionMatrix[0][0], projectionMatrix[1][1]);
 
     mat3 J;
