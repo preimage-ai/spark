@@ -1,0 +1,45 @@
+name: Build code and release it as a tarball
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      # - name: Setup Bun
+      #   uses: oven-sh/setup-bun@v2
+      #   with:
+      #     bun-version: latest
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        cache: 'npm'
+
+      - name: Install All Dependencies
+        run: npm ci
+
+      - name: Compile Spark Viewer
+        run: npm run build
+
+      - name: Package Release Tarball
+        run: |
+          TARBALL_NAME=$(npm pack)
+          echo "TARBALL_PATH=$TARBALL_NAME" >> $GITHUB_ENV
+
+      - name: Publish to Releases
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: ${{ env.TARBALL_PATH }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
