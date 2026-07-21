@@ -20,6 +20,7 @@ export type Rgba8Readback = Dyno<{ index: "int" }, { rgba8: "vec4" }>;
 export type ReadbackBuffer =
   | ArrayBuffer
   | Uint8Array
+  | Uint8ClampedArray
   | Int8Array
   | Uint16Array
   | Int16Array
@@ -48,7 +49,7 @@ export class Readback {
 
   // Ensure we have a buffer large enough for the readback of count indices.
   // Pass in previous bufer of the desired type.
-  ensureBuffer<B extends ReadbackBuffer>(count: number, buffer: B): B {
+  static ensureBuffer<B extends ReadbackBuffer>(count: number, buffer: B): B {
     // Readback is performed in a 2D array of pixels, so round up with SPLAT_TEX_WIDTH
     const roundedCount =
       Math.ceil(Math.max(1, count) / SPLAT_TEX_WIDTH) * SPLAT_TEX_WIDTH;
@@ -65,6 +66,10 @@ export class Readback {
 
     const ctor = buffer.constructor as { new (arrayBuffer: ArrayBuffer): B };
     return new ctor(newBuffer) as B;
+  }
+
+  ensureBuffer<B extends ReadbackBuffer>(count: number, buffer: B): B {
+    return Readback.ensureBuffer(count, buffer);
   }
 
   // Ensure our render target is large enough for the readback of capacity indices.
@@ -114,7 +119,7 @@ export class Readback {
       // Create a program from the template and graph
       program = new DynoProgram({
         graph,
-        inputs: { index: "index" },
+        inputs: { index: "_index" },
         outputs: { rgba8: "target" },
         template: Readback.programTemplate,
       });
@@ -133,6 +138,7 @@ export class Readback {
 
   private saveRenderState(renderer: THREE.WebGLRenderer) {
     return {
+      target: renderer.getRenderTarget(),
       xrEnabled: renderer.xr.enabled,
       autoClear: renderer.autoClear,
     };
@@ -141,11 +147,12 @@ export class Readback {
   private resetRenderState(
     renderer: THREE.WebGLRenderer,
     state: {
+      target: THREE.WebGLRenderTarget | null;
       xrEnabled: boolean;
       autoClear: boolean;
     },
   ) {
-    renderer.setRenderTarget(null);
+    renderer.setRenderTarget(state.target);
     renderer.xr.enabled = state.xrEnabled;
     renderer.autoClear = state.autoClear;
   }
@@ -250,6 +257,8 @@ export class Readback {
 
       baseIndex += SPLAT_TEX_WIDTH * layerYEnd;
     }
+    // const gl = renderer.getContext() as WebGL2RenderingContext;
+    // gl.flush();
     return Promise.all(promises).then(() => readback);
   }
 
@@ -331,7 +340,7 @@ export class Readback {
   static programTemplate: DynoProgramTemplate | null = null;
 
   // Cache for Rgba8Readback programs
-  static readbackProgram = new Map<Rgba8Readback, DynoProgram>();
+  static readbackProgram = new WeakMap<Rgba8Readback, DynoProgram>();
 
   // Static full-screen quad for pseudo-compute shader rendering
   static fullScreenQuad = new FullScreenQuad(

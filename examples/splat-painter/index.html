@@ -47,10 +47,10 @@
   <script type="importmap">
     {
       "imports": {
-        "three": "/examples/js/vendor/three/build/three.module.js",
-        "three/addons/": "/examples/js/vendor/three/examples/jsm/",
-        "lil-gui": "/examples/js/vendor/lil-gui/dist/lil-gui.esm.js",
-        "@sparkjsdev/spark": "/dist/spark.module.js"
+        "three": "../js/vendor/three/build/three.module.js",
+        "three/addons/": "../js/vendor/three/examples/jsm/",
+        "@sparkjsdev/spark": "../../dist/spark.module.js",
+        "lil-gui": "../js/vendor/lil-gui/dist/lil-gui.esm.js"
       }
     }
   </script>
@@ -59,16 +59,15 @@
       dyno,
       SparkRenderer,
       SplatMesh,
-      SplatTransformer,
+      RgbaArray,
+      readRgbaArray,
       SparkControls,
       SpzWriter,
       unpackSplat,
       PackedSplats,
-      RgbaArray,
-      readRgbaArray,
     } from "@sparkjsdev/spark";
     import * as THREE from "three";
-    import { getAssetFileURL } from "/examples/js/get-asset-url.js";
+    import { getAssetFileURL } from "../js/get-asset-url.js";
     import { GUI } from "lil-gui";
 
 
@@ -110,7 +109,7 @@
         const luminanceThreshold = dyno.dynoFloat(0.1);
         return dyno.dynoBlock({ gsplat: dyno.Gsplat }, { gsplat: dyno.Gsplat }, ({ gsplat }) => {
             if (!gsplat) {
-            throw new Error("No gsplat input");
+                throw new Error("No gsplat input");
             }
             let { center, rgb, opacity, index } = dyno.splitGsplat(gsplat).outputs;
             const projectionAmplitude = dyno.dot(brushDirection, dyno.sub(center, brushOrigin));
@@ -119,7 +118,6 @@
             const isInside = dyno.and(dyno.lessThan(distance, brushRadius), 
                                       dyno.and(dyno.greaterThan(projectionAmplitude, dyno.dynoFloat(0.0)),
                                       dyno.lessThan(projectionAmplitude, brushDepth)));
-            
             // Paint/erase mode: change RGB or alpha values for splats inside brush
             const luminanceOld = dyno.div(dyno.dot(rgb, flatColor), dyno.dynoFloat(3.0));
             const luminanceNew = dyno.div(dyno.dot(brushColor, flatColor), dyno.dynoFloat(3.0));
@@ -156,20 +154,28 @@
         url: url,
         onFrame: ({ mesh, time }) => {
           mesh.needsUpdate = true;
-        }
+        },
+        onLoad: () => {
+          splatMesh.worldModifier = brushDyno(
+            brushEnabled,
+            eraseEnabled,
+            undoEnabled,
+            brushRadius, 
+            brushDepth,
+            brushOrigin, 
+            brushDirection, 
+            brushColor,
+            originalRgba,
+          );
+          splatMesh.splatRgba = new RgbaArray().fromPackedSplats({
+            packedSplats: splatMesh.packedSplats,
+            base: 0,
+            count: splatMesh.packedSplats.numSplats,
+            renderer,
+          });
+          splatMesh.updateGenerator();
+        },
       });
-      splatMesh.worldModifier = brushDyno(
-        brushEnabled,
-        eraseEnabled,
-        undoEnabled,
-        brushRadius, 
-        brushDepth,
-        brushOrigin, 
-        brushDirection, 
-        brushColor,
-        originalRgba,
-      );
-      splatMesh.updateGenerator();
       return splatMesh;
     }
 
@@ -178,9 +184,7 @@
     renderer.setClearColor(new THREE.Color(0xaaffff), 1);
 
     const scene = new THREE.Scene();
-    const spark = new SparkRenderer({
-      renderer,
-    });
+    const spark = new SparkRenderer({ renderer });
     scene.add(spark);
     const controls = new SparkControls({
       canvas: renderer.domElement,
@@ -213,10 +217,8 @@
       }
       // Extract filename for export
       currentFileName = url.split("/").pop().split("?")[0].split(".")[0] || "painted-splat";
-      
       // Create an empty RgbaArray that will be populated after the mesh loads
       currentSplatMeshOriginalRGBA = new RgbaArray();
-      
       currentSplatMesh = await paintableSplatMesh(
         url,
         PARAMETERS.brushEnabled,
@@ -231,10 +233,10 @@
       );
       currentSplatMesh.quaternion.set(1, 0, 0, 0);
       scene.add(currentSplatMesh);
-      
+
       // Wait for the mesh to fully load before accessing packed data
       await currentSplatMesh.initialized;
-      
+
       // Extract original RGBA directly from the packed splats
       currentSplatMeshOriginalRGBA = new RgbaArray();
       currentSplatMeshOriginalRGBA.fromPackedSplats({
@@ -283,6 +285,25 @@
       }, 2000);
     }
 
+    function updateRgba() {
+      if (currentSplatMesh) {
+        const newRgba = new RgbaArray();
+        newRgba.render({
+          renderer,
+          count: currentSplatMesh.packedSplats.numSplats,
+          reader: dyno.dynoBlock({ index: "int" }, { rgba8: "vec4" }, ({ index }) => {
+            const { gsplat } = currentSplatMesh.generator.apply({ index });
+            const { rgba } = dyno.splitGsplat(gsplat).outputs;
+            return { rgba8: rgba };
+          }),
+        });
+
+        currentSplatMesh.splatRgba.dispose();
+        currentSplatMesh.splatRgba = newRgba;
+        currentSplatMesh.updateGenerator();
+      }
+    }
+
     renderer.domElement.addEventListener('pointermove', (event) => {
         const clickCoords = new THREE.Vector2(
           (event.clientX / renderer.domElement.width) * 2 - 1,
@@ -298,32 +319,14 @@
         PARAMETERS.brushOrigin.value.z = raycaster.ray.origin.z;
 
         // Apply painting effect while dragging
-        if (isDragging && currentSplatMesh) {
-          const noSplatRgba = !currentSplatMesh.splatRgba;
-          currentSplatMesh.splatRgba = spark.getRgba(
-            { generator: currentSplatMesh , rgba: currentSplatMesh.splatRgba}
-          );
-          if (noSplatRgba) {
-            currentSplatMesh.updateGenerator();
-          } else {
-            currentSplatMesh.updateVersion();
-          }
+        if (isDragging) {
+          updateRgba();
         }
-    });
+      });
     
     renderer.domElement.addEventListener('pointerdown', (event) => {
       isDragging = true;
-      if (currentSplatMesh) {
-        const noSplatRgba = !currentSplatMesh.splatRgba;
-        currentSplatMesh.splatRgba = spark.getRgba(
-          { generator: currentSplatMesh , rgba: currentSplatMesh.splatRgba}
-        );
-        if (noSplatRgba) {
-          currentSplatMesh.updateGenerator();
-        } else {
-          currentSplatMesh.updateVersion();
-        }
-      }
+      updateRgba();
     });
     
     renderer.domElement.addEventListener('pointerup', (event) => {
@@ -363,7 +366,7 @@
       PARAMETERS.brushColor.value = new THREE.Color(value).convertLinearToSRGB();
       console.log(PARAMETERS.brushColor.value);
     });
-    
+
     // I/O functionality (load and export)
     const ioOptions = {
       filename: currentFileName,
@@ -414,10 +417,17 @@
             currentSplatMesh.updateGenerator();
           }
           
-          const rgbaBytes = await spark.readRgba({ 
-            generator: currentSplatMesh,
-            rgba: currentSplatMesh.splatRgba 
-          });
+          const rgba = new RgbaArray();
+          rgba.render({
+            renderer,
+            count: currentSplatMesh.packedSplats.numSplats,
+            reader: dyno.dynoBlock({ index: "int" }, { rgba8: "vec4" }, ({ index }) => {
+              const { gsplat } = currentSplatMesh.generator.apply({ index });
+              const { rgba } = dyno.splitGsplat(gsplat).outputs;
+              return { rgba8: rgba };
+            }),
+          })
+          const rgbaBytes = await rgba.read();
           
           const ogSplats = currentSplatMesh.packedSplats;
           const totalSplats = ogSplats.numSplats;
@@ -527,33 +537,32 @@
     ioFolder.add(ioOptions, "saveToSpz").name("Save Splats (SPZ)");
     ioFolder.open();
 
-
         // Keyboard controls
     window.addEventListener('keydown', (event) => {
-    if (event.key === '1') {
-      // Brush mode
-      PARAMETERS.brushEnabled.value = true;
-      PARAMETERS.eraseEnabled.value = false;
-      PARAMETERS.undoEnabled.value = false;
-      PARAMETERS.controlsEnabled = false;
-      controls.enabled = false;
-      showModeOverlay('Paint Mode');
-    } else if (event.key === '2') {
-      // Eraser mode
-      PARAMETERS.brushEnabled.value = false;
-      PARAMETERS.eraseEnabled.value = true;
-      PARAMETERS.undoEnabled.value = false;
-      PARAMETERS.controlsEnabled = false;
-      controls.enabled = false;
-      showModeOverlay('Erase Mode');
-    } else if (event.key === '3') {
-      // Undo mode
-      PARAMETERS.brushEnabled.value = false;
-      PARAMETERS.eraseEnabled.value = false;
-      PARAMETERS.undoEnabled.value = true;
-      PARAMETERS.controlsEnabled = false;
-      controls.enabled = false;
-      showModeOverlay('Undo Mode');
+      if (event.key === '1') {
+        // Brush mode
+        PARAMETERS.brushEnabled.value = true;
+        PARAMETERS.eraseEnabled.value = false;
+        PARAMETERS.undoEnabled.value = false;
+        PARAMETERS.controlsEnabled = false;
+        controls.enabled = false;
+        showModeOverlay('Paint Mode');
+      } else if (event.key === '2') {
+        // Eraser mode
+        PARAMETERS.brushEnabled.value = false;
+        PARAMETERS.eraseEnabled.value = true;
+        PARAMETERS.undoEnabled.value = false;
+        PARAMETERS.controlsEnabled = false;
+        controls.enabled = false;
+        showModeOverlay('Erase Mode');
+      } else if (event.key === '3') {
+        // Undo mode
+        PARAMETERS.brushEnabled.value = false;
+        PARAMETERS.eraseEnabled.value = false;
+        PARAMETERS.undoEnabled.value = true;
+        PARAMETERS.controlsEnabled = false;
+        controls.enabled = false;
+        showModeOverlay('Undo Mode');
       } else if (event.key === 'Escape') {
         // View mode
         PARAMETERS.brushEnabled.value = false;
@@ -592,11 +601,7 @@
     console.log("Starting render loop");
 
     // Animation loop
-    let lastTime = 0;
-    renderer.setAnimationLoop((rawTime) => {
-      rawTime *= 0.0005;
-      const deltaTime = rawTime - (lastTime ?? rawTime);
-      lastTime = rawTime;
+    renderer.setAnimationLoop(() => {
       if (PARAMETERS.controlsEnabled) {
         controls.update(camera);
       }

@@ -54,23 +54,23 @@
   <script type="importmap">
     {
       "imports": {
-        "three": "/examples/js/vendor/three/build/three.module.js",
-        "three/addons/": "/examples/js/vendor/three/examples/jsm/",
-        "@sparkjsdev/spark": "/dist/spark.module.js",
-        "lil-gui": "/examples/js/vendor/lil-gui/dist/lil-gui.esm.js"
+        "three": "../js/vendor/three/build/three.module.js",
+        "three/addons/": "../js/vendor/three/examples/jsm/",
+        "@sparkjsdev/spark": "../../dist/spark.module.js",
+        "lil-gui": "../js/vendor/lil-gui/dist/lil-gui.esm.js"
       }
     }
   </script>
   <canvas id="canvas" tabindex="0"></canvas>
   <div id="main-gui"></div>
   <div id="second-gui"></div>
-  <input id="file-input" type="file" accept=".ply,.spz,.splat,.ksplat,.zip" multiple="true" style="display: none;" />
+  <input id="file-input" type="file" accept=".ply,.spz,.splat,.ksplat,.zip,.sog,.rad" multiple="true" style="display: none;" />
   <script type="module">
     import * as THREE from "three";
     import { OrbitControls } from "three/addons/controls/OrbitControls.js";
     import { GUI } from "lil-gui";
     import { constructGrid, SparkControls, SparkRenderer, SplatMesh, textSplats, dyno, transcodeSpz, isMobile, isPcSogs, LN_SCALE_MIN, LN_SCALE_MAX } from "@sparkjsdev/spark";
-    import { getAssetFileURL } from "/examples/js/get-asset-url.js";
+    import { getAssetFileURL } from "../js/get-asset-url.js";
 
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.01, 1000);
@@ -106,6 +106,7 @@
       }),
     });
     grid.opacity = 0;
+    grid.visible = false;
     scene.add(grid);
 
     const stats = new Stats();
@@ -135,18 +136,21 @@
       loadFiles([...event.target.files]);
     };
 
+    let instructions = null;
     const guiOptions = {
       highDevicePixel: !isMobile(),
       stats: false,
       resetOnLoad: true,
       loadOffset: 0,
-      openCv: true,
+      coordSystem: "OpenGL",
       autoRotate: true,
       orbit: false,
       reversePointerDir: false,
       reversePointerSlide: false,
       backgroundColor: "#000000",
       viewBoundingBox: false,
+      showCones: false,
+      splatCount: "-",
       openFiles: () => {
         fileInput.click();
       },
@@ -158,7 +162,7 @@
             loadFiles(urls);
             guiOptions.loadFromText = ""; // Clear after loading
           } else {
-            alert("No valid URLs found in text. URLs must start with http:// or https:// and end with .ply, .spz, .splat, .ksplat, .json, or .zip");
+            alert("No valid URLs found in text. URLs must start with http:// or https:// and end with .ply, .spz, .splat, .ksplat, .json, .zip, .sog, or .rad");
           }
         }
       },
@@ -172,10 +176,15 @@
     };
 
     function resetFrameQuaternion() {
-      if (guiOptions.openCv) {
+      if (guiOptions.coordSystem === "OpenCV") {
         frame.quaternion.set(1, 0, 0, 0);
-      } else {
+      } else if (guiOptions.coordSystem === "OpenGL") {
         frame.quaternion.set(0, 0, 0, 1);
+      } else if (guiOptions.coordSystem === "Z-up") {
+        frame.quaternion.set(-1, 0, 0, 1).normalize();
+      }
+      if (instructions) {
+        instructions.quaternion.copy(frame.quaternion).invert();
       }
     }
 
@@ -346,15 +355,15 @@
         for (const child of toRemove) {
           frame.remove(child);
         }
+        instructions = null;
         // Clear original file bytes when resetting
         inputs.length = 0;
         splatsFolder.foldersRecursive().forEach((child) => child.destroy());
       }
 
-      guiOptions.openCv = true;
       guiOptions.autoRotate = false;
       resetFrameQuaternion();
-      writeOptions.filename = "";
+      // writeOptions.filename = "";
 
       // Show progress bar if loading from URLs
       const hasUrls = splatFiles.some(file => typeof file === "string");
@@ -365,32 +374,27 @@
       let index = 0;
       for (const splatFile of splatFiles) {
         try {
-          let fileBytes;
-          let fileName;
-          let url = null;
+          let fileName = undefined;
+          let stream = undefined;
+          let streamLength = undefined;
+          let url = undefined;
 
           // Check if splatFile is a URL string or a File object
           if (typeof splatFile === "string") {
-            // It's a URL, fetch it
-            console.log(`Fetching ${splatFile}...`);
-            fileBytes = new Uint8Array(await fetchWithProgress(splatFile));
-            // Extract filename from URL
+            url = splatFile;
             fileName = splatFile.split("/").pop().split("?")[0] || "downloaded-file";
-
-            if (isPcSogs(fileBytes)) {
-              url = splatFile;
-            }
           } else {
             // It's a File object
-            fileBytes = new Uint8Array(await splatFile.arrayBuffer());
             fileName = splatFile.name;
+            stream = splatFile.stream();
+            streamLength = splatFile.size;
           }
 
-          if (writeOptions.filename === "") {
-            writeOptions.filename = fileName.split(".")[0];
-          }
+          // if (writeOptions.filename === "") {
+          //   writeOptions.filename = fileName.split(".")[0];
+          // }
 
-          const init = url ? { url } : { fileBytes: fileBytes.slice(), fileName };
+          const init = { url, fileName, stream, streamLength, ...splatExtra };
           init.splatEncoding = { ...splatEncoding };
           const splatMesh = new SplatMesh(init);
           const translate = guiOptions.loadOffset * index
@@ -399,12 +403,13 @@
           splatMesh.worldModifier = makeWorldModifier(splatMesh);
           await splatMesh.initialized;
 
-          if (!url) {
-            // PC SOGS transcode not supported yet
-            inputs.push({ fileBytes, pathOrUrl: fileName, object: splatMesh });
-          }
+          // if (!url) {
+          //   // PC SOGS transcode not supported yet
+          //   inputs.push({ fileBytes, pathOrUrl: fileName, object: splatMesh });
+          // }
           frame.add(splatMesh);
-          console.log(`Loaded ${fileName} with ${splatMesh.numSplats} splats`);
+          const numSplats = splatMesh.splats?.lodSplats?.numSplats ?? splatMesh.splats?.numSplats;
+          console.log(`Loaded ${fileName} with ${numSplats} splats`);
           addBoundingBoxHelper(splatMesh);
 
           const splatFolder = splatsFolder.addFolder(fileName).close();
@@ -451,7 +456,7 @@
     secondGui.add(guiOptions, "loadFromTextAction").name("Load from URL(s)");
 
     cameraFolder.add(guiOptions, "resetPose").name("Reset pose");
-    cameraFolder.add(guiOptions, "openCv").name("OpenCV coordinates")
+    cameraFolder.add(guiOptions, "coordSystem", ["OpenCV", "OpenGL", "Z-up"]).name("Coordinate system")
       .listen()
       .onChange(resetFrameQuaternion);
     cameraFolder.add(guiOptions, "autoRotate").name("Auto rotate")
@@ -491,14 +496,101 @@
     }
     setHighDpi(guiOptions.highDevicePixel);
 
+    const splatExtra = {
+      extSplats: true,
+      lod: false,
+    };
+
+    function makeConeMesh(fov0) {
+      const radius = 32;
+      const height = 32;
+      const segments = 32;
+      const geometry = new THREE.ConeGeometry(radius, height, segments, 1, true);
+      geometry.translate(0, -height / 2, 0);
+      geometry.rotateX(Math.PI / 2); // Now faces -Z
+
+      const edges = new THREE.EdgesGeometry(geometry);
+      return new THREE.LineSegments(
+        edges,
+        new THREE.LineBasicMaterial({ color: fov0 ? 0xffcc00 : 0x00ccff })
+      );
+    }
+
+    function makeConeCircles(fov0) {
+      const group = new THREE.Group();
+      const segments = 32;
+      const color = fov0 ? 0xffcc00 : 0x00ccff;
+      const material = new THREE.LineBasicMaterial({ color });
+
+      for (const z of [0.0625, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0]) {
+        const geometry = new THREE.BufferGeometry();
+        const vertices = [];
+
+        for (let j = 0; j <= segments; ++j) {
+          const theta = (j / segments) * 2 * Math.PI;
+          const x = Math.cos(theta) * z;
+          const y = Math.sin(theta) * z;
+          vertices.push(x, y, -z);
+        }
+
+        geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+        const line = new THREE.Line(geometry, material);
+        group.add(line);
+      }
+
+      group.add(makeConeMesh(fov0));
+      return group;
+    }
+
+    const cone0Mesh = makeConeCircles(true);
+    cone0Mesh.visible = false;
+    scene.add(cone0Mesh);
+
+    const coneMesh = makeConeCircles(false);
+    coneMesh.visible = false;
+    scene.add(coneMesh);
+
+    function updateConeMeshes() {
+      const tan0 = Math.tan(0.5 * spark.coneFov0 * Math.PI / 180);
+      cone0Mesh.scale.set(tan0, tan0, 1);
+      const tan = Math.tan(0.5 * spark.coneFov * Math.PI / 180);
+      coneMesh.scale.set(tan, tan, 1);
+    }
+
+    const lodFolder = gui.addFolder("Level-of-Detail").close();
+    lodFolder.add(splatExtra, "lod").name("Create Level-of-Detail on load")
+    lodFolder.add(spark, "lodSplatScale", 0.001, 3.0, 0.001).name("LoD splat scale").listen();
+    lodFolder.add(spark, "lodRenderScale", 0.1, 10.0, 0.1).name("Min LoD pixel size").listen();
+    lodFolder.add(guiOptions, "splatCount").name("Current splat count").listen();
+    lodFolder.add(spark, "coneFov0", 0.0, 170.0, 1.0).name("Cone Fov0").listen().onChange(updateConeMeshes);
+    lodFolder.add(spark, "coneFov", 0.0, 170.0, 1.0).name("Cone Fov").listen().onChange(updateConeMeshes);
+    lodFolder.add(guiOptions, "showCones").name("Show FOV cones").listen().onChange((show) => {
+      cone0Mesh.visible = show;
+      coneMesh.visible = show;
+    });
+    updateConeMeshes();
+    lodFolder.add(spark, "coneFoveate", 0.0, 1.0, 0.01).name("Cone Foveate").listen();
+    lodFolder.add(spark, "behindFoveate", 0.0, 1.0, 0.01).name("Behind Foveate").listen();
+    lodFolder.add(spark, "enableDriveLod").name("Enable LoD updates").listen();
+    lodFolder.add(spark, "lodInflate").name("Soften LoD splats").listen();
+    lodFolder.add(spark, "lodTraverseMode", ["standard", "dynamic"]).name("LoD traverse mode").listen();
+
+    const pageColoring = dyno.dynoBool(false);
+    lodFolder.add(pageColoring, "value").name("Page Coloring").listen().onChange(() => {
+      updateFrameSplats();
+    });
+
     gui.add(guiOptions, "highDevicePixel").name("High DPI").onChange((value) => {
       setHighDpi(value);
     });
     gui.add(guiOptions, "stats").name("Show frame stats").onChange((value) => {
       stats.dom.style.display = value ? "block" : "none";
     });
-    gui.add(spark.defaultView, "sortRadial").name("Radial sort").listen();
-    gui.add(grid, "opacity", 0, 1, 0.01).name("Grid opacity").listen();
+    gui.add(spark, "sortRadial").name("Radial sort").listen();
+    // gui.add(spark, "enableRayEval").name("3DGUT/3DRT/HTGS").listen();
+    gui.add(grid, "opacity", 0, 1, 0.01).name("Grid opacity").listen().onChange((value) => {
+      grid.visible = value > 0;
+    });
     gui.add({
       logFocalDistance: 0.0,
     }, "logFocalDistance", -2, 2, 0.01).name("Ln(Focal distance)").onChange((value) => {
@@ -538,43 +630,38 @@
       },
     }, "AA").name("AA preset");
     debugFolder.add(spark, "focalAdjustment", 0.1, 2.0, 0.1).name("Tweak focalAdjustment");
-    spark.defaultView.sort32 = true;
-    debugFolder.add(spark.defaultView, "sort32").name("Float32 sort").listen();
+    // debugFolder.add(spark, "sort32").name("Float32 sort").listen();
     debugFolder.add(spark, "minPixelRadius", 0, 16, 0.1).name("Min pixel radius").listen();
     debugFolder.add(spark, "maxPixelRadius", 1, 1024, 1).name("Max pixel radius").listen();
     debugFolder.add(spark, "minAlpha", 0, 1, 0.001).name("Min alpha").listen();
 
     debugFolder.add(spark, "premultipliedAlpha").name("Premultiplied alpha").listen();
-    debugFolder.add(spark.defaultView, "stochastic").name("Stochastic sort-free").listen().onChange(touch);
+    // debugFolder.add(spark.defaultView, "stochastic").name("Stochastic sort-free").listen().onChange(touch);
 
-    const accumFolder = debugFolder.addFolder("Accumulator encoding").close();;
-    accumFolder.add(spark.splatEncoding, "rgbMin", -1, 1, 0.1).name("RGB min").onChange(touch);
-    accumFolder.add(spark.splatEncoding, "rgbMax", 0, 4, 0.1).name("RGB max").onChange(touch);
-    accumFolder.add(spark.splatEncoding, "lnScaleMin", -14, -2.5, 0.1).name("Ln scale min").onChange(touch);
-    accumFolder.add(spark.splatEncoding, "lnScaleMax", -14, 14, 0.1).name("Ln scale max").onChange(touch);
+    // const accumFolder = debugFolder.addFolder("Accumulator encoding").close();;
+    // accumFolder.add(spark.splatEncoding, "rgbMin", -1, 1, 0.1).name("RGB min").onChange(touch);
+    // accumFolder.add(spark.splatEncoding, "rgbMax", 0, 4, 0.1).name("RGB max").onChange(touch);
+    // accumFolder.add(spark.splatEncoding, "lnScaleMin", -14, -2.5, 0.1).name("Ln scale min").onChange(touch);
+    // accumFolder.add(spark.splatEncoding, "lnScaleMax", -14, 14, 0.1).name("Ln scale max").onChange(touch);
 
     const splatEncoding = {
       rgbMin: 0.0,
       rgbMax: 1.0,
       lnScaleMin: LN_SCALE_MIN,
       lnScaleMax: LN_SCALE_MAX,
-      sh1Min: -1,
       sh1Max: 1,
-      sh2Min: -1,
       sh2Max: 1,
-      sh3Min: -1,
       sh3Max: 1,
+      lodOpacity: false,
     };
-    const splatFolder = debugFolder.addFolder("SplatMesh encoding").close();
+    const splatFolder = gui.addFolder("SplatMesh encoding").close();
+    splatFolder.add(splatExtra, "extSplats").name("Extended splats");
     splatFolder.add(splatEncoding, "rgbMin", -1, 1, 0.1).name("RGB min").onChange(touch);
     splatFolder.add(splatEncoding, "rgbMax", 0, 4, 0.1).name("RGB max").onChange(touch);
     splatFolder.add(splatEncoding, "lnScaleMin", -14, -2.5, 0.1).name("Ln scale min").onChange(touch);
     splatFolder.add(splatEncoding, "lnScaleMax", -14, 14, 0.1).name("Ln scale max").onChange(touch);
-    splatFolder.add(splatEncoding, "sh1Min", -6, 6, 0.1).name("SH1 min").onChange(touch);
     splatFolder.add(splatEncoding, "sh1Max", -6, 6, 0.1).name("SH1 max").onChange(touch);
-    splatFolder.add(splatEncoding, "sh2Min", -6, 6, 0.1).name("SH2 min").onChange(touch);
     splatFolder.add(splatEncoding, "sh2Max", -6, 6, 0.1).name("SH2 max").onChange(touch);
-    splatFolder.add(splatEncoding, "sh3Min", -6, 6, 0.1).name("SH3 min").onChange(touch);
     splatFolder.add(splatEncoding, "sh3Max", -6, 6, 0.1).name("SH3 max").onChange(touch);
 
     const splatsFolder = secondGui.addFolder("Files");
@@ -609,7 +696,7 @@
       return dyno.dynoBlock({ gsplat: dyno.Gsplat }, { gsplat: dyno.Gsplat }, ({ gsplat }) => {
         // Color by world normal if it's enabled
         let worldNormal = dyno.gsplatNormal(gsplat);
-        let { rgb, center, opacity } = dyno.splitGsplat(gsplat).outputs;
+        let { index, rgb, center, opacity } = dyno.splitGsplat(gsplat).outputs;
         // Compute vector from view to object coordinate in gsplat
         const worldToView = context.worldToView;
         const viewGsplat = worldToView.applyGsplat(gsplat);
@@ -620,6 +707,11 @@
         normal = dyno.select(sameDir, dyno.neg(worldNormal), worldNormal);
         const normalRgb = dyno.add(dyno.mul(normal, dyno.dynoConst("float", 0.5)), dyno.dynoConst("float", 0.5));
         rgb = dyno.select(normalColor, normalRgb, rgb);
+
+        const page = dyno.shr(index, dyno.dynoConst("int", 16));
+        let debugColor = dyno.debugColorHue(page);
+        debugColor = dyno.mul(debugColor, rgb)
+        rgb = dyno.mix(rgb, debugColor, dyno.float(pageColoring));
 
         // Zero out opacity if outside clip bounds
         const { x, y, z } = dyno.split(center).outputs;
@@ -642,55 +734,55 @@
       });
     }
 
-    const exportFolder = secondGui.addFolder("Export Gsplats").close();
-    const writeOptions = {
-      filename: "gsplats",
-      trimOpacity: true,
-      trimOpacityThreshold: 0,
-      maxSh: 3,
-      fractionalBits: 12,
-      writeSpz: async () => {
-        const transcodeInputs = inputs.map((input) => {
-          return {
-            fileBytes: new Uint8Array(input.fileBytes),
-            pathOrUrl: input.pathOrUrl,
-            transform: {
-              translate: input.object.position.toArray(),
-              quaternion: input.object.quaternion.toArray(),
-              scale: (input.object.scale.x + input.object.scale.y + input.object.scale.z) / 3,
-            },
-          };
-        });
+    // const exportFolder = secondGui.addFolder("Export Gsplats").close();
+    // const writeOptions = {
+    //   filename: "gsplats",
+    //   trimOpacity: true,
+    //   trimOpacityThreshold: 0,
+    //   maxSh: 3,
+    //   fractionalBits: 12,
+    //   writeSpz: async () => {
+    //     const transcodeInputs = inputs.map((input) => {
+    //       return {
+    //         fileBytes: new Uint8Array(input.fileBytes),
+    //         pathOrUrl: input.pathOrUrl,
+    //         transform: {
+    //           translate: input.object.position.toArray(),
+    //           quaternion: input.object.quaternion.toArray(),
+    //           scale: (input.object.scale.x + input.object.scale.y + input.object.scale.z) / 3,
+    //         },
+    //       };
+    //     });
 
-        const clipXyz = clipEnable.value ? {
-          min: [clipMinX.value, clipMinY.value, clipMinZ.value],
-          max: [clipMaxX.value, clipMaxY.value, clipMaxZ.value],
-        } : undefined;
-        const maxSh = writeOptions.maxSh;
-        const fractionalBits = writeOptions.fractionalBits;
-        const opacityThreshid = writeOptions.trimOpacity ? writeOptions.trimOpacityThreshold : undefined;
-        const transcode = await transcodeSpz({ inputs: transcodeInputs, maxSh, clipXyz, fractionalBits, opacityThreshold: opacityThreshid });
+    //     const clipXyz = clipEnable.value ? {
+    //       min: [clipMinX.value, clipMinY.value, clipMinZ.value],
+    //       max: [clipMaxX.value, clipMaxY.value, clipMaxZ.value],
+    //     } : undefined;
+    //     const maxSh = writeOptions.maxSh;
+    //     const fractionalBits = writeOptions.fractionalBits;
+    //     const opacityThreshid = writeOptions.trimOpacity ? writeOptions.trimOpacityThreshold : undefined;
+    //     const transcode = await transcodeSpz({ inputs: transcodeInputs, maxSh, clipXyz, fractionalBits, opacityThreshold: opacityThreshid });
 
-        if (transcode.clippedCount && transcode.clippedCount > 0) {
-          console.log(`Clipped ${transcode.clippedCount} splats. Consider decreasing fractional-bits from ${fractionalBits} to reduce clipping.`);
-          alert(`Clipped ${transcode.clippedCount} splats. Consider decreasing fractional-bits from ${fractionalBits} to reduce clipping.`);
-        }
+    //     if (transcode.clippedCount && transcode.clippedCount > 0) {
+    //       console.log(`Clipped ${transcode.clippedCount} splats. Consider decreasing fractional-bits from ${fractionalBits} to reduce clipping.`);
+    //       alert(`Clipped ${transcode.clippedCount} splats. Consider decreasing fractional-bits from ${fractionalBits} to reduce clipping.`);
+    //     }
 
-        const blob = new Blob([transcode.fileBytes], { type: "application/octet-stream" });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = writeOptions.filename + ".spz";
-        a.click();
-        URL.revokeObjectURL(url);
-      },
-    };
-    exportFolder.add(writeOptions, "filename").name("Filename").listen();
-    exportFolder.add(writeOptions, "trimOpacity").name("Trim low opacity");
-    exportFolder.add(writeOptions, "trimOpacityThreshold").name("Trim opacity <= 0..1");
-    exportFolder.add(writeOptions, "maxSh", 0, 3, 1).name("Max spherical harmonics");
-    exportFolder.add(writeOptions, "fractionalBits", 6, 24, 1).name("Fractional bits");
-    exportFolder.add(writeOptions, "writeSpz").name("Create .spz and download");
+    //     const blob = new Blob([transcode.fileBytes], { type: "application/octet-stream" });
+    //     const url = URL.createObjectURL(blob);
+    //     const a = document.createElement("a");
+    //     a.href = url;
+    //     a.download = writeOptions.filename + ".spz";
+    //     a.click();
+    //     URL.revokeObjectURL(url);
+    //   },
+    // };
+    // exportFolder.add(writeOptions, "filename").name("Filename").listen();
+    // exportFolder.add(writeOptions, "trimOpacity").name("Trim low opacity");
+    // exportFolder.add(writeOptions, "trimOpacityThreshold").name("Trim opacity <= 0..1");
+    // exportFolder.add(writeOptions, "maxSh", 0, 3, 1).name("Max spherical harmonics");
+    // exportFolder.add(writeOptions, "fractionalBits", 6, 24, 1).name("Fractional bits");
+    // exportFolder.add(writeOptions, "writeSpz").name("Create .spz and download");
 
     function makeInstructions() {
       const instructions = textSplats({
@@ -699,14 +791,14 @@
         fontSize: 64,
         objectScale: 0.1 / 64,
       });
-      instructions.quaternion.set(1, 0, 0, 0);
+      instructions.quaternion.copy(frame.quaternion).invert();
       instructions.enableWorldToView = true;
       instructions.worldModifier = makeWorldModifier(instructions);
       instructions.updateGenerator();
       return instructions;
     }
 
-    const instructions = makeInstructions();
+    instructions = makeInstructions();
     addBoundingBoxHelper(instructions);
     frame.add(instructions);
 
@@ -755,7 +847,8 @@
         file.name.toLowerCase().endsWith('.splat') ||
         file.name.toLowerCase().endsWith('.ksplat') ||
         file.name.toLowerCase().endsWith('.zip') ||
-        file.name.toLowerCase().endsWith('.sog')
+        file.name.toLowerCase().endsWith('.sog') ||
+        file.name.toLowerCase().endsWith('.rad')
       );
 
       if (splatFiles.length > 0) {
@@ -765,7 +858,7 @@
 
     // Parse URLs from text (handles single URLs, multiple lines, mixed content)
     function parseURLsFromText(text) {
-      const supportedExtensions = [".ply", ".spz", ".splat", ".ksplat", ".zip", ".json"];
+      const supportedExtensions = [".ply", ".spz", ".splat", ".ksplat", ".zip", ".json",  ".sog", ".rad"];
       const urls = [];
 
       // Split by lines, commas, and semicolons
@@ -798,7 +891,13 @@
       stats.begin();
 
       if (guiOptions.autoRotate) {
-        frame.rotation.y += deltaTime / 5000;
+        if (guiOptions.coordSystem === "OpenCV") {
+          frame.rotation.y = time / 5000;
+        } else if (guiOptions.coordSystem === "OpenGL") {
+          frame.rotation.y = -time / 5000;
+        } else if (guiOptions.coordSystem === "Z-up") {
+          frame.rotation.z = -time / 5000;
+        }
       }
 
       if (guiOptions.orbit) {
@@ -807,7 +906,15 @@
         controls.update(camera);
       }
 
+      const lodPos = spark.currentLod?.pos ?? new THREE.Vector3().copy(camera.position);
+      const lodQuat = spark.currentLod?.quat ?? new THREE.Quaternion().copy(camera.quaternion);
+      cone0Mesh.position.copy(lodPos);
+      cone0Mesh.quaternion.copy(lodQuat);
+      coneMesh.position.copy(lodPos);
+      coneMesh.quaternion.copy(lodQuat);
+
       renderer.render(scene, camera);
+      guiOptions.splatCount = `${spark.display.numSplats}`;
 
       stats.end();
     });

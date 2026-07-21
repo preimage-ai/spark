@@ -9,20 +9,24 @@ Copy and paste code below in an `index.html` file or remix in the [Web Playgroun
 <script type="importmap">
   {
     "imports": {
-      "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.178.0/three.module.js",
-      "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/0.1.10/spark.module.js"
+      "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
+      "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/2.1.0/spark.module.js"
     }
   }
 </script>
 <script type="module">
   import * as THREE from "three";
-  import { SplatMesh } from "@sparkjsdev/spark";
+  import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
 
   const scene = new THREE.Scene();
-  const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+  const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 1000);
   const renderer = new THREE.WebGLRenderer();
   renderer.setSize(window.innerWidth, window.innerHeight);
   document.body.appendChild(renderer.domElement)
+
+  const spark = new SparkRenderer({ renderer });
+  scene.add(spark);
 
   const splatURL = "https://sparkjs.dev/assets/splats/butterfly.spz";
   const butterfly = new SplatMesh({ url: splatURL });
@@ -47,6 +51,7 @@ npm install @sparkjsdev/spark
 Build Spark (It requires [Rust](https://www.rust-lang.org/tools/install) installed in your machine)
 ```
 npm install
+npm run build:wasm
 npm run dev
 ```
 
@@ -54,17 +59,21 @@ This will run a Web server at [http://localhost:8080/](http://localhost:8080/) w
 
 ## Table of Contents
 
+- [New Features in 2.0](new-features-2.0.md)
+- [0.1 → 2.0 Migration Guide](0.1-2.0-migration-guide.md)
+- [Spark Level-of-Detail](lod-getting-started.md)
 - [Spark Overview](overview.md)
 - [System Design](system-design.md)
 - [SparkRenderer](spark-renderer.md)
-- [SparkViewpoint](spark-viewpoint.md)
 - [SplatMesh](splat-mesh.md)
 - [PackedSplats](packed-splats.md)
+- [ExtSplats](ext-splats.md)
 - [Loading Gsplats](loading-splats.md)
 - [Procedural Splats](procedural-splats.md)
 - [Splat RGBA-XYZ SDF editing](splat-editing.md)
 - [Dyno overview](dyno-overview.md)
 - [Dyno standard library](dyno-stdlib.md)
+- [Level-of-Detail Deep Dive](new-spark-renderer.md)
 - [Controls](controls.md)
 - [Performance tuning](performance.md)
 - [Community Resources](community-resources.md)

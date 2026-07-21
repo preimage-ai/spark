@@ -1,22 +1,46 @@
 import { FileLoader, Loader, LoadingManager } from 'three';
-import { PackedSplats, SplatEncoding } from './PackedSplats';
+import { ExtSplats } from './ExtSplats';
+import { PackedSplats } from './PackedSplats';
 import { SplatMesh } from './SplatMesh';
+import { SplatFileType } from './defines';
 export declare class SplatLoader extends Loader {
     fileLoader: FileLoader;
-    fileType?: SplatFileType;
-    packedSplats?: PackedSplats;
     constructor(manager?: LoadingManager);
-    load(url: string, onLoad?: (decoded: PackedSplats) => void, onProgress?: (event: ProgressEvent) => void, onError?: (error: unknown) => void): void;
-    loadAsync(url: string, onProgress?: (event: ProgressEvent) => void): Promise<PackedSplats>;
+    load(url: string, onLoad?: (decoded: PackedSplats | ExtSplats) => void, onProgress?: (event: ProgressEvent) => void, onError?: (error: unknown) => void): void;
+    loadAsync(url: string, onProgress?: (event: ProgressEvent) => void): Promise<PackedSplats | ExtSplats>;
     parse(packedSplats: PackedSplats): SplatMesh;
-}
-export declare enum SplatFileType {
-    PLY = "ply",
-    SPZ = "spz",
-    SPLAT = "splat",
-    KSPLAT = "ksplat",
-    PCSOGS = "pcsogs",
-    PCSOGSZIP = "pcsogszip"
+    loadInternal({ packedSplats, extSplats, url, fileBytes, fileType, fileName, stream, streamLength, onLoad, onProgress, onError, lod, nonLod, lodAbove, lodBase, }: {
+        packedSplats?: PackedSplats;
+        extSplats?: ExtSplats;
+        url?: string;
+        fileBytes?: Uint8Array | ArrayBuffer;
+        fileType?: SplatFileType;
+        fileName?: string;
+        stream?: ReadableStream;
+        streamLength?: number;
+        onLoad?: (decoded: PackedSplats | ExtSplats) => void;
+        onProgress?: (event: ProgressEvent) => void;
+        onError?: (error: unknown) => void;
+        lod?: boolean | "quality";
+        nonLod?: boolean;
+        lodAbove?: number;
+        lodBase?: number;
+    }): void;
+    loadInternalAsync({ packedSplats, extSplats, url, fileBytes, fileType, fileName, stream, streamLength, onProgress, lod, nonLod, lodAbove, lodBase, }: {
+        packedSplats?: PackedSplats;
+        extSplats?: ExtSplats;
+        url?: string;
+        fileBytes?: Uint8Array | ArrayBuffer;
+        fileType?: SplatFileType;
+        fileName?: string;
+        stream?: ReadableStream;
+        streamLength?: number;
+        onProgress?: (event: ProgressEvent) => void;
+        lod?: boolean;
+        nonLod?: boolean;
+        lodAbove?: number;
+        lodBase?: number;
+    }): Promise<unknown>;
 }
 export declare function getSplatFileType(fileBytes: Uint8Array): SplatFileType | undefined;
 export declare function getFileExtension(pathOrUrl: string): string;
@@ -91,17 +115,6 @@ export declare function tryPcSogsZip(input: ArrayBuffer | Uint8Array): {
     name: string;
     json: PcSogsJson | PcSogsV2Json;
 } | undefined;
-export declare function unpackSplats({ input, extraFiles, fileType, pathOrUrl, splatEncoding, }: {
-    input: Uint8Array | ArrayBuffer;
-    extraFiles?: Record<string, ArrayBuffer>;
-    fileType?: SplatFileType;
-    pathOrUrl?: string;
-    splatEncoding?: SplatEncoding;
-}): Promise<{
-    packedArray: Uint32Array;
-    numSplats: number;
-    extra?: Record<string, unknown>;
-}>;
 export declare class SplatData {
     numSplats: number;
     maxSplats: number;
@@ -129,10 +142,6 @@ export declare class SplatData {
     setSh2(index: number, sh2: Float32Array): void;
     setSh3(index: number, sh3: Float32Array): void;
 }
-export declare function transcodeSpz(input: TranscodeSpzInput): Promise<{
-    input: TranscodeSpzInput;
-    fileBytes: Uint8Array;
-}>;
 export type FileInput = {
     fileBytes: Uint8Array;
     fileType?: SplatFileType;

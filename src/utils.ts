@@ -13,6 +13,9 @@ import {
 } from "./defines.js";
 import { unindent } from "./dyno/base.js";
 
+export const threeRevision = Number.parseInt(THREE.REVISION);
+export const threeMrtArray = threeRevision >= 179;
+
 const f32buffer = new Float32Array(1);
 const u32buffer = new Uint32Array(f32buffer.buffer);
 const supportsFloat16Array = "Float16Array" in globalThis;
@@ -186,22 +189,37 @@ export class DataCache {
   // Function to fetch data for a key
   asyncFetch: (key: string) => Promise<unknown>;
 
+  // Function to dispose of data when it is no longer needed
+  dispose?: (data: unknown) => void;
+
   // Array of cached items
   items: { key: string; data: unknown }[];
+
+  // In-progress fetch promises
+  pending: Map<string, Promise<unknown>>;
 
   // Create a DataCache with a given function that fetches data not in the cache.
   constructor({
     asyncFetch,
+    dispose,
     maxItems = 5,
-  }: { asyncFetch: (key: string) => Promise<unknown>; maxItems?: number }) {
+  }: {
+    asyncFetch: (key: string) => Promise<unknown>;
+    dispose?: (data: unknown) => void;
+    maxItems?: number;
+  }) {
     this.asyncFetch = asyncFetch;
+    this.dispose = dispose;
     this.maxItems = maxItems;
     this.items = [];
+    this.pending = new Map();
   }
 
-  // Fetch data for the key, returning cached data if available.
-  async getFetch(key: string): Promise<unknown> {
-    // Fetches data for a key and caches it, returns cached data if available.
+  has(key: string): boolean {
+    return this.items.some((item) => item.key === key);
+  }
+
+  getImmediate(key: string): unknown | undefined {
     const index = this.items.findIndex((item) => item.key === key);
     if (index >= 0) {
       // Data exists in our cache, move it to the end of the array
@@ -210,17 +228,38 @@ export class DataCache {
       // Return the cached data
       return item.data;
     }
+    return undefined;
+  }
 
-    // Fetch the data from the asyncFetch function
-    const data = await this.asyncFetch(key);
-    // Add the data to the cache
-    this.items.push({ key, data });
-    // If the cache is too large, remove the oldest accessed item
-    while (this.items.length > this.maxItems) {
-      this.items.shift();
+  // Fetch data for the key, returning cached data if available.
+  async getFetch(key: string): Promise<unknown> {
+    const immediate = this.getImmediate(key);
+    if (immediate !== undefined) {
+      return immediate;
     }
-    // Return the fetched data
-    return data;
+
+    let pending = this.pending.get(key);
+    if (pending) {
+      return pending;
+    }
+
+    pending = this.asyncFetch(key).then((data) => {
+      this.pending.delete(key);
+
+      // Add the data to the cache
+      this.items.push({ key, data });
+      // If the cache is too large, remove the oldest accessed item
+      while (this.items.length > this.maxItems) {
+        const removed = this.items.shift();
+        if (removed && this.dispose) {
+          this.dispose(removed.data);
+        }
+      }
+      // Return the fetched data
+      return data;
+    });
+    this.pending.set(key, pending);
+    return pending;
   }
 }
 
@@ -255,8 +294,8 @@ export function mapFilterObject(
 
 // Recursively finds all ArrayBuffers in an object and returns them as an array
 // to use as transferable objects to send between workers.
-export function getArrayBuffers(ctx: unknown): Transferable[] {
-  const buffers: ArrayBuffer[] = [];
+export function getTransferable(ctx: unknown): Transferable[] {
+  const buffers: Transferable[] = [];
   const seen = new Set();
 
   function traverse(obj: unknown) {
@@ -267,7 +306,7 @@ export function getArrayBuffers(ctx: unknown): Transferable[] {
         buffers.push(obj);
       } else if (ArrayBuffer.isView(obj)) {
         // Handles TypedArrays and DataView
-        buffers.push(obj.buffer);
+        buffers.push(obj.buffer as ArrayBuffer);
       } else if (Array.isArray(obj)) {
         obj.forEach(traverse);
       } else {
@@ -358,6 +397,64 @@ export class FreeList<T, Args> {
   }
 }
 
+export function encodeExtSplat(
+  extArrays: [Uint32Array, Uint32Array],
+  index: number,
+  x: number,
+  y: number,
+  z: number,
+  scaleX: number,
+  scaleY: number,
+  scaleZ: number,
+  quatX: number,
+  quatY: number,
+  quatZ: number,
+  quatW: number,
+  opacity: number,
+  r: number,
+  g: number,
+  b: number,
+) {
+  const i4 = index * 4;
+  const [extA, extB] = extArrays;
+  extA[i4] = floatBitsToUint(x);
+  extA[i4 + 1] = floatBitsToUint(y);
+  extA[i4 + 2] = floatBitsToUint(z);
+  extA[i4 + 3] = toHalf(opacity);
+  extB[i4] = toHalf(r) | (toHalf(g) << 16);
+  extB[i4 + 1] = toHalf(b) | (toHalf(Math.log(scaleX)) << 16);
+  extB[i4 + 2] = toHalf(Math.log(scaleY)) | (toHalf(Math.log(scaleZ)) << 16);
+  extB[i4 + 3] = encodeQuatOctXy1010R12(quatX, quatY, quatZ, quatW);
+}
+
+export function decodeExtSplat(
+  extArrays: [Uint32Array, Uint32Array],
+  index: number,
+): {
+  center: THREE.Vector3;
+  scales: THREE.Vector3;
+  quaternion: THREE.Quaternion;
+  color: THREE.Color;
+  opacity: number;
+} {
+  // Returns a static object which is reused each time
+  const result = packedFields;
+  const i4 = index * 4;
+  const [extA, extB] = extArrays;
+  result.center.x = uintBitsToFloat(extA[i4]);
+  result.center.y = uintBitsToFloat(extA[i4 + 1]);
+  result.center.z = uintBitsToFloat(extA[i4 + 2]);
+  result.opacity = fromHalf(extA[i4 + 3] & 0xffff);
+  result.color.r = fromHalf(extB[i4] & 0xffff);
+  result.color.g = fromHalf(extB[i4] >>> 16);
+  result.color.b = fromHalf(extB[i4 + 1] & 0xffff);
+  result.scales.x = Math.exp(fromHalf(extB[i4 + 1] >>> 16));
+  result.scales.y = Math.exp(fromHalf(extB[i4 + 2] & 0xffff));
+  result.scales.z = Math.exp(fromHalf(extB[i4 + 2] >>> 16));
+  decodeQuatOctXy1010R12(extB[i4 + 3], result.quaternion);
+  return result;
+}
+
 // Encode a PackedSplat as 4 consecutive Uint32 elements in the packedSplats array.
 // The center coordinates x,y,z are encoded as float16, the scales x,y,z as a
 // logarithmic uint8, rotation as three uint8s representing rotation axis and angle,
@@ -384,6 +481,7 @@ export function setPackedSplat(
     rgbMax?: number;
     lnScaleMin?: number;
     lnScaleMax?: number;
+    lodOpacity?: boolean;
   },
 ) {
   const rgbMin = encoding?.rgbMin ?? 0.0;
@@ -392,7 +490,7 @@ export function setPackedSplat(
   const uR = floatToUint8((r - rgbMin) / rgbRange);
   const uG = floatToUint8((g - rgbMin) / rgbRange);
   const uB = floatToUint8((b - rgbMin) / rgbRange);
-  const uA = floatToUint8(opacity);
+  const uA = floatToUint8(encoding?.lodOpacity ? 0.5 * opacity : opacity);
 
   // Alternate internal encodings commented out below.
   const uQuat = encodeQuatOctXy88R8(
@@ -565,6 +663,7 @@ export function setPackedSplatRgba(
   encoding?: {
     rgbMin?: number;
     rgbMax?: number;
+    lodOpacity?: boolean;
   },
 ) {
   const rgbMin = encoding?.rgbMin ?? 0.0;
@@ -573,7 +672,7 @@ export function setPackedSplatRgba(
   const uR = floatToUint8((r - rgbMin) / rgbRange);
   const uG = floatToUint8((g - rgbMin) / rgbRange);
   const uB = floatToUint8((b - rgbMin) / rgbRange);
-  const uA = floatToUint8(a);
+  const uA = floatToUint8(encoding?.lodOpacity ? 0.5 * a : a);
   const i4 = index * 4;
   packedSplats[i4] = uR | (uG << 8) | (uB << 16) | (uA << 24);
 }
@@ -636,6 +735,7 @@ export function unpackSplat(
     rgbMax?: number;
     lnScaleMin?: number;
     lnScaleMax?: number;
+    lodOpacity?: boolean;
   },
 ): {
   center: THREE.Vector3;
@@ -662,6 +762,9 @@ export function unpackSplat(
     rgbMin + (((word0 >>> 16) & 0xff) / 255) * rgbRange,
   );
   result.opacity = ((word0 >>> 24) & 0xff) / 255;
+  if (encoding?.lodOpacity) {
+    result.opacity = 2.0 * result.opacity;
+  }
   result.center.set(
     fromHalf(word1 & 0xffff),
     fromHalf((word1 >>> 16) & 0xffff),
@@ -732,6 +835,9 @@ export function computeMaxSplats(numSplats: number): number {
 
 // Heuristic function to determine if we are running on a mobile device.
 export function isMobile(): boolean {
+  if (navigator.platform.toLowerCase().startsWith("win")) {
+    return false;
+  }
   if (navigator.maxTouchPoints > 0) {
     // Touch-enabled device, assume it's mobile
     return true;
@@ -744,12 +850,31 @@ export function isMobile(): boolean {
 // Heuristic function to determine if we are running on an Android device.
 // (does not include Oculus Quest)
 export function isAndroid(): boolean {
-  return /Android/.test(navigator.userAgent);
+  return (
+    /Android/.test(navigator.userAgent) || /Tizen/.test(navigator.userAgent)
+  );
 }
 
 // Heuristic function to determine if we are running on an Oculus Quest device.
 export function isOculus(): boolean {
-  return /Oculus/.test(navigator.userAgent);
+  return !!navigator.xr && /Oculus/.test(navigator.userAgent);
+}
+
+export function isQuest2() {
+  return isOculus() && /Quest 2/.test(navigator.userAgent);
+}
+
+export function isIos(): boolean {
+  return /iPhone|iPad/.test(navigator.userAgent);
+}
+
+export function isVisionPro(): boolean {
+  return (
+    !!navigator.xr &&
+    isIos() &&
+    /Safari/.test(navigator.userAgent) &&
+    isMobile()
+  );
 }
 
 // Take an array of RGBA8 encoded pixels and flip them vertically in-place.
@@ -799,16 +924,6 @@ export function pixelsToPngUrl(
   imageData.data.set(pixels);
   ctx.putImageData(imageData, 0, 0);
   return canvas.toDataURL("image/png");
-}
-
-// Manually clone a THREE.Clock object.
-export function cloneClock(clock: THREE.Clock): THREE.Clock {
-  const newClock = new THREE.Clock(clock.autoStart);
-  newClock.startTime = clock.startTime;
-  newClock.oldTime = clock.oldTime;
-  newClock.elapsedTime = clock.elapsedTime;
-  newClock.running = clock.running;
-  return newClock;
 }
 
 // Utility to filter out an undefined values from an object.
@@ -1165,6 +1280,84 @@ export function decodeQuatEulerXyz888(
   return out;
 }
 
+export function encodeQuatOctXy1010R12(
+  qx: number,
+  qy: number,
+  qz: number,
+  qw: number,
+): number {
+  const qlen = Math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw);
+  // Force the minimal representation (q.w >= 0)
+  const qnx = (qw < 0 ? -qx : qx) / qlen;
+  const qny = (qw < 0 ? -qy : qy) / qlen;
+  const qnz = (qw < 0 ? -qz : qz) / qlen;
+  const qnw = (qw < 0 ? -qw : qw) / qlen;
+  // Compute the rotation angle θ in [0, π]
+  const theta = 2 * Math.acos(qnw);
+  // Recover the rotation axis (default to (1,0,0) for near-zero rotation)
+  const xyz_norm = Math.sqrt(qnx * qnx + qny * qny + qnz * qnz);
+  const axisX = xyz_norm < 1e-6 ? 1 : qnx / xyz_norm;
+  const axisY = xyz_norm < 1e-6 ? 0 : qny / xyz_norm;
+  const axisZ = xyz_norm < 1e-6 ? 0 : qnz / xyz_norm;
+
+  // --- Folded Octahedral Mapping (inline) ---
+  // Compute p = (axis.x, axis.y) / (|axis.x|+|axis.y|+|axis.z|)
+  const sum = Math.abs(axisX) + Math.abs(axisY) + Math.abs(axisZ);
+  let p_x = axisX / sum;
+  let p_y = axisY / sum;
+  // Fold the lower hemisphere.
+  if (axisZ < 0) {
+    const tmp = p_x;
+    p_x = (1 - Math.abs(p_y)) * (p_x >= 0 ? 1 : -1);
+    p_y = (1 - Math.abs(tmp)) * (p_y >= 0 ? 1 : -1);
+  }
+  // Remap from [-1,1] to [0,1]
+  const u_f = p_x * 0.5 + 0.5;
+  const v_f = p_y * 0.5 + 0.5;
+  // Quantize to 10 bits (0..1023)
+  const quantU = Math.round(u_f * 1023);
+  const quantV = Math.round(v_f * 1023);
+  // --- Angle Quantization: Quantize θ ∈ [0,π] to 12 bits (0..4095) ---
+  const angleInt = Math.round(theta * (4095 / Math.PI));
+
+  // Pack into 32 bits: bits [0–9]: quantU, [10–19]: quantV, [20–31]: angleInt.
+  return (angleInt << 20) | (quantV << 10) | quantU;
+}
+
+export function decodeQuatOctXy1010R12(
+  encoded: number,
+  out: THREE.Quaternion,
+): THREE.Quaternion {
+  // Extract 10‐bit quantU and quantV, and 12‐bit angleInt.
+  const quantU = encoded & 0x3ff; // bits 0–9
+  const quantV = (encoded >>> 10) & 0x3ff; // bits 10–19
+  const angleInt = (encoded >>> 20) & 0xfff; // bits 20–31
+
+  // Recover u and v in [0,1] then map to [-1,1]
+  const u_f = quantU / 1023;
+  const v_f = quantV / 1023;
+  let f_x = (u_f - 0.5) * 2;
+  let f_y = (v_f - 0.5) * 2;
+  // Inverse folded mapping: recover z from the constraint |p_x|+|p_y|+z = 1.
+  const f_z = 1 - (Math.abs(f_x) + Math.abs(f_y));
+  const t = Math.max(-f_z, 0);
+  f_x += f_x >= 0 ? -t : t;
+  f_y += f_y >= 0 ? -t : t;
+  const axisLen = Math.sqrt(f_x * f_x + f_y * f_y + f_z * f_z);
+  const axisX = axisLen < 1e-6 ? 0 : f_x / axisLen;
+  const axisY = axisLen < 1e-6 ? 0 : f_y / axisLen;
+  const axisZ = axisLen < 1e-6 ? 0 : f_z / axisLen;
+
+  // Decode the angle: θ ∈ [0,π]
+  const theta = (angleInt / 4095) * Math.PI;
+  const halfTheta = theta * 0.5;
+  const s = Math.sin(halfTheta);
+  const w = Math.cos(halfTheta);
+  // Reconstruct the quaternion from axis-angle: (axis * sin(θ/2), cos(θ/2))
+  out.set(axisX * s, axisY * s, axisZ * s, w);
+  return out;
+}
+
 // Pack four signed 8-bit values into a single uint32.
 function packSint8Bytes(
   b0: number,
@@ -1172,10 +1365,10 @@ function packSint8Bytes(
   b2: number,
   b3: number,
 ): number {
-  const clampedB0 = Math.max(-127, Math.min(127, b0 * 127));
-  const clampedB1 = Math.max(-127, Math.min(127, b1 * 127));
-  const clampedB2 = Math.max(-127, Math.min(127, b2 * 127));
-  const clampedB3 = Math.max(-127, Math.min(127, b3 * 127));
+  const clampedB0 = Math.round(Math.max(-127, Math.min(127, b0 * 127)));
+  const clampedB1 = Math.round(Math.max(-127, Math.min(127, b1 * 127)));
+  const clampedB2 = Math.round(Math.max(-127, Math.min(127, b2 * 127)));
+  const clampedB3 = Math.round(Math.max(-127, Math.min(127, b3 * 127)));
   return (
     (clampedB0 & 0xff) |
     ((clampedB1 & 0xff) << 8) |
@@ -1191,19 +1384,16 @@ export function encodeSh1Rgb(
   index: number,
   sh1Rgb: Float32Array,
   encoding?: {
-    sh1Min?: number;
     sh1Max?: number;
   },
 ) {
-  const sh1Min = encoding?.sh1Min ?? -1;
   const sh1Max = encoding?.sh1Max ?? 1;
-  const sh1Mid = 0.5 * (sh1Min + sh1Max);
-  const sh1Scale = 126 / (sh1Max - sh1Min);
+  const sh1Scale = 63 / sh1Max;
 
   // Pack sint7 values into 2 x uint32
   const base = index * 2;
   for (let i = 0; i < 9; ++i) {
-    const s = (sh1Rgb[i] - sh1Mid) * sh1Scale;
+    const s = sh1Rgb[i] * sh1Scale;
     const value = Math.round(Math.max(-63, Math.min(63, s))) & 0x7f;
     const bitStart = i * 7;
     const bitEnd = bitStart + 7;
@@ -1227,38 +1417,35 @@ export function encodeSh2Rgb(
   index: number,
   sh2Rgb: Float32Array,
   encoding?: {
-    sh2Min?: number;
     sh2Max?: number;
   },
 ) {
-  const sh2Min = encoding?.sh2Min ?? -1;
   const sh2Max = encoding?.sh2Max ?? 1;
-  const sh2Mid = 0.5 * (sh2Min + sh2Max);
-  const sh2Scale = 2 / (sh2Max - sh2Min);
+  const sh2Scale = 1 / sh2Max;
 
   // Pack sint8 values into 4 x uint32
   sh2Array[index * 4 + 0] = packSint8Bytes(
-    (sh2Rgb[0] - sh2Mid) * sh2Scale,
-    (sh2Rgb[1] - sh2Mid) * sh2Scale,
-    (sh2Rgb[2] - sh2Mid) * sh2Scale,
-    (sh2Rgb[3] - sh2Mid) * sh2Scale,
+    sh2Rgb[0] * sh2Scale,
+    sh2Rgb[1] * sh2Scale,
+    sh2Rgb[2] * sh2Scale,
+    sh2Rgb[3] * sh2Scale,
   );
   sh2Array[index * 4 + 1] = packSint8Bytes(
-    (sh2Rgb[4] - sh2Mid) * sh2Scale,
-    (sh2Rgb[5] - sh2Mid) * sh2Scale,
-    (sh2Rgb[6] - sh2Mid) * sh2Scale,
-    (sh2Rgb[7] - sh2Mid) * sh2Scale,
+    sh2Rgb[4] * sh2Scale,
+    sh2Rgb[5] * sh2Scale,
+    sh2Rgb[6] * sh2Scale,
+    sh2Rgb[7] * sh2Scale,
   );
   sh2Array[index * 4 + 2] = packSint8Bytes(
-    (sh2Rgb[8] - sh2Mid) * sh2Scale,
-    (sh2Rgb[9] - sh2Mid) * sh2Scale,
-    (sh2Rgb[10] - sh2Mid) * sh2Scale,
-    (sh2Rgb[11] - sh2Mid) * sh2Scale,
+    sh2Rgb[8] * sh2Scale,
+    sh2Rgb[9] * sh2Scale,
+    sh2Rgb[10] * sh2Scale,
+    sh2Rgb[11] * sh2Scale,
   );
   sh2Array[index * 4 + 3] = packSint8Bytes(
-    (sh2Rgb[12] - sh2Mid) * sh2Scale,
-    (sh2Rgb[13] - sh2Mid) * sh2Scale,
-    (sh2Rgb[14] - sh2Mid) * sh2Scale,
+    sh2Rgb[12] * sh2Scale,
+    sh2Rgb[13] * sh2Scale,
+    sh2Rgb[14] * sh2Scale,
     0,
   );
 }
@@ -1270,19 +1457,16 @@ export function encodeSh3Rgb(
   index: number,
   sh3Rgb: Float32Array,
   encoding?: {
-    sh3Min?: number;
     sh3Max?: number;
   },
 ) {
-  const sh3Min = encoding?.sh3Min ?? -1;
   const sh3Max = encoding?.sh3Max ?? 1;
-  const sh3Mid = 0.5 * (sh3Min + sh3Max);
-  const sh3Scale = 62 / (sh3Max - sh3Min);
+  const sh3Scale = 31 / sh3Max;
 
   // Pack sint6 values into 4 x uint32
   const base = index * 4;
   for (let i = 0; i < 21; ++i) {
-    const s = (sh3Rgb[i] - sh3Mid) * sh3Scale;
+    const s = sh3Rgb[i] * sh3Scale;
     const value = Math.round(Math.max(-31, Math.min(31, s))) & 0x3f;
     const bitStart = i * 6;
     const bitEnd = bitStart + 6;
@@ -1296,6 +1480,96 @@ export function encodeSh3Rgb(
       const secondWord = (value >>> (32 - bitOffset)) & 0xffffffff;
       sh3Array[base + wordStart + 1] |= secondWord;
     }
+  }
+}
+
+export function encodeExtRgb(r: number, g: number, b: number): number {
+  const ar = Math.abs(r);
+  const ag = Math.abs(g);
+  const ab = Math.abs(b);
+  const maxAbs = Math.max(ar, ag, ab);
+  const base = Math.floor(Math.log2(maxAbs));
+  const biasedBase = Math.max(0, Math.min(31, base + 15));
+  const divisor = 2 ** (biasedBase - 15) / 255;
+  const uR = Math.round(Math.max(0, Math.min(255, ar / divisor)));
+  const uG = Math.round(Math.max(0, Math.min(255, ag / divisor)));
+  const uB = Math.round(Math.max(0, Math.min(255, ab / divisor)));
+  const expSigns =
+    (biasedBase << 3) |
+    ((r < 0 ? 0x1 : 0) | (g < 0 ? 0x2 : 0) | (b < 0 ? 0x4 : 0));
+  return uR | (uG << 8) | (uB << 16) | (expSigns << 24);
+}
+
+export function decodeExtRgb(encoded: number): THREE.Color {
+  const color = packedFields.color;
+  const biasedBase = (encoded >>> 27) & 0x1f;
+  const divisor = 2 ** (biasedBase - 15) / 255;
+  const r = (encoded & 0xff) * divisor;
+  const g = ((encoded >>> 8) & 0xff) * divisor;
+  const b = ((encoded >>> 16) & 0xff) * divisor;
+  color.r = encoded & 0x1000000 ? -r : r;
+  color.g = encoded & 0x2000000 ? -g : g;
+  color.b = encoded & 0x4000000 ? -b : b;
+  return color;
+}
+
+export function encodeExtSh1Rgb(
+  sh1Array: Uint32Array,
+  index: number,
+  sh1Rgb: Float32Array,
+) {
+  const i4 = index * 4;
+  for (let k = 0; k < 3; ++k) {
+    const k3 = k * 3;
+    sh1Array[i4 + k] = encodeExtRgb(sh1Rgb[k3], sh1Rgb[k3 + 1], sh1Rgb[k3 + 2]);
+  }
+}
+
+export function encodeExtSh12Rgb(
+  sh1Array: Uint32Array,
+  sh2Array: Uint32Array,
+  index: number,
+  sh1Rgb: Float32Array,
+  sh2Rgb: Float32Array,
+) {
+  const i4 = index * 4;
+  for (let k = 0; k < 3; ++k) {
+    const k3 = k * 3;
+    sh1Array[i4 + k] = encodeExtRgb(sh1Rgb[k3], sh1Rgb[k3 + 1], sh1Rgb[k3 + 2]);
+  }
+  sh1Array[i4 + 3] = encodeExtRgb(sh2Rgb[0], sh2Rgb[1], sh2Rgb[2]);
+  for (let k = 1; k < 5; ++k) {
+    const k5 = k * 5;
+    sh2Array[i4 + (k - 1)] = encodeExtRgb(
+      sh2Rgb[k5],
+      sh2Rgb[k5 + 1],
+      sh2Rgb[k5 + 2],
+    );
+  }
+}
+
+export function encodeExt3Rgb(
+  sh3ArrayA: Uint32Array,
+  sh3ArrayB: Uint32Array,
+  index: number,
+  sh3Rgb: Float32Array,
+) {
+  const i4 = index * 4;
+  for (let k = 0; k < 4; ++k) {
+    const k3 = k * 3;
+    sh3ArrayA[i4 + k] = encodeExtRgb(
+      sh3Rgb[k3],
+      sh3Rgb[k3 + 1],
+      sh3Rgb[k3 + 2],
+    );
+  }
+  for (let k = 4; k < 7; ++k) {
+    const k3 = k * 3;
+    sh3ArrayB[i4 + (k - 4)] = encodeExtRgb(
+      sh3Rgb[k3],
+      sh3Rgb[k3 + 1],
+      sh3Rgb[k3 + 2],
+    );
   }
 }
 
@@ -1351,7 +1625,7 @@ export class GunzipReader {
   constructor({
     fileBytes,
     chunkBytes = 64 * 1024,
-  }: { fileBytes: Uint8Array; chunkBytes?: number }) {
+  }: { fileBytes: Uint8Array<ArrayBuffer>; chunkBytes?: number }) {
     this.fileBytes = fileBytes;
     this.chunkBytes = chunkBytes;
     this.chunks = [];
@@ -1391,4 +1665,45 @@ export class GunzipReader {
     this.totalBytes -= numBytes;
     return result;
   }
+}
+
+export function uploadU32DataTextureRows(
+  renderer: THREE.WebGLRenderer,
+  texture: THREE.Texture,
+  width: number,
+  rows: number,
+  data: Uint32Array,
+) {
+  const gl = renderer.getContext() as WebGL2RenderingContext;
+
+  const props = renderer.properties.get(texture) as {
+    __webglTexture: WebGLTexture;
+  };
+  const glTexture = props?.__webglTexture;
+  if (!glTexture) {
+    throw new Error("texture not found");
+  }
+  // Note: instead of saving and restoring the pixelStorei parameters
+  //       renderer.state.pixelStorei can be used with Three.js >= r184
+  const currentFlipY = gl.getParameter(gl.UNPACK_FLIP_Y_WEBGL);
+  const currentPremultiply = gl.getParameter(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL);
+  renderer.state.activeTexture(gl.TEXTURE0);
+  renderer.state.bindTexture(gl.TEXTURE_2D, glTexture);
+  gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, null);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  gl.texSubImage2D(
+    gl.TEXTURE_2D,
+    0,
+    0,
+    0,
+    width,
+    rows,
+    gl.RGBA_INTEGER,
+    gl.UNSIGNED_INT,
+    data,
+  );
+  renderer.state.unbindTexture();
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, currentFlipY);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, currentPremultiply);
 }

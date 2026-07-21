@@ -24,9 +24,10 @@
   <script type="importmap">
     {
       "imports": {
-        "three": "/examples/js/vendor/three/build/three.module.js",
-        "lil-gui": "/examples/js/vendor/lil-gui/dist/lil-gui.esm.js",
-        "@sparkjsdev/spark": "/dist/spark.module.js"
+        "three": "../js/vendor/three/build/three.module.js",
+        "three/addons/": "../js/vendor/three/examples/jsm/",
+        "@sparkjsdev/spark": "../../dist/spark.module.js",
+        "lil-gui": "../js/vendor/lil-gui/dist/lil-gui.esm.js"
       }
     }
   </script>
@@ -36,10 +37,9 @@
       SparkRenderer,
       PointerControls,
       SplatMesh,
-      VRButton,
     } from "@sparkjsdev/spark";
     import GUI from "lil-gui";
-    import { getAssetFileURL } from "/examples/js/get-asset-url.js";
+    import { getAssetFileURL } from "../js/get-asset-url.js";
 
     // cloud bounds
     const BOUNDS = {

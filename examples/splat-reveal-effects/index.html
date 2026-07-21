@@ -19,16 +19,17 @@
   <script type="importmap">
     {
       "imports": {
-        "three": "/examples/js/vendor/three/build/three.module.js",
-        "lil-gui": "/examples/js/vendor/lil-gui/dist/lil-gui.esm.js",
-        "@sparkjsdev/spark": "/dist/spark.module.js"
+        "three": "../js/vendor/three/build/three.module.js",
+        "three/addons/": "../js/vendor/three/examples/jsm/",
+        "@sparkjsdev/spark": "../../dist/spark.module.js",
+        "lil-gui": "../js/vendor/lil-gui/dist/lil-gui.esm.js"
       }
     }
   </script>
   <script type="module">
     import * as THREE from "three";
-    import { SparkControls, SplatMesh, dyno } from "@sparkjsdev/spark";
-    import { getAssetFileURL } from "/examples/js/get-asset-url.js";
+    import { SparkRenderer, SparkControls, SplatMesh, dyno } from "@sparkjsdev/spark";
+    import { getAssetFileURL } from "../js/get-asset-url.js";
     import GUI from "lil-gui";
 
     const scene = new THREE.Scene();
@@ -40,6 +41,10 @@
     
     const renderer = new THREE.WebGLRenderer();
     renderer.setSize(window.innerWidth, window.innerHeight);
+
+    const spark = new SparkRenderer({ renderer });
+    scene.add(spark);
+
     document.body.appendChild(renderer.domElement);
 
     window.addEventListener('resize', onWindowResize, false);

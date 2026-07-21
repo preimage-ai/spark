@@ -1,54 +1,50 @@
 import * as THREE from "three";
 import { FullScreenQuad } from "three/addons/postprocessing/Pass.js";
 
+import type { RgbaArray } from "./RgbaArray";
 import type { GsplatGenerator } from "./SplatGenerator";
-import { type SplatFileType, SplatLoader, unpackSplats } from "./SplatLoader";
+import { SplatLoader } from "./SplatLoader";
+import type { SplatSource } from "./SplatMesh";
+import { workerPool } from "./SplatWorker";
 import {
+  DEFAULT_SPLAT_ENCODING,
   LN_SCALE_MAX,
   LN_SCALE_MIN,
   SPLAT_TEX_HEIGHT,
   SPLAT_TEX_WIDTH,
+  type SplatEncoding,
+  type SplatFileType,
 } from "./defines";
 import {
+  Dyno,
+  DynoInt,
   DynoProgram,
   DynoProgramTemplate,
-  DynoSampler2D,
   type DynoType,
   DynoUniform,
-  DynoVec2,
+  DynoUsampler2DArray,
+  type DynoVal,
+  DynoVec3,
   DynoVec4,
+  add,
   dynoBlock,
+  normalize,
   outputPackedSplat,
+  sub,
+  unindent,
+  unindentLines,
 } from "./dyno";
-import { TPackedSplats, definePackedSplats } from "./dyno/splats";
+import {
+  type Gsplat,
+  TPackedSplats,
+  combineGsplat,
+  definePackedSplats,
+  readPackedSplat,
+  splatTexCoord,
+  splitGsplat,
+} from "./dyno/splats";
 import { getShaders } from "./shaders";
 import { getTextureSize, setPackedSplat, unpackSplat } from "./utils";
-
-export type SplatEncoding = {
-  rgbMin?: number;
-  rgbMax?: number;
-  lnScaleMin?: number;
-  lnScaleMax?: number;
-  sh1Min?: number;
-  sh1Max?: number;
-  sh2Min?: number;
-  sh2Max?: number;
-  sh3Min?: number;
-  sh3Max?: number;
-};
-
-export const DEFAULT_SPLAT_ENCODING: SplatEncoding = {
-  rgbMin: 0,
-  rgbMax: 1,
-  lnScaleMin: LN_SCALE_MIN,
-  lnScaleMax: LN_SCALE_MAX,
-  sh1Min: -1,
-  sh1Max: 1,
-  sh2Min: -1,
-  sh2Max: 1,
-  sh3Min: -1,
-  sh3Max: 1,
-};
 
 // Initialize a PackedSplats collection from source data via
 // url, fileBytes, or packedArray. Creates an empty array if none are set,
@@ -67,6 +63,10 @@ export type PackedSplatsOptions = {
   fileType?: SplatFileType;
   // File name to use for type detection. (default: undefined)
   fileName?: string;
+  // Stream to read the Gaussian splat file from. (default: undefined)
+  stream?: ReadableStream;
+  // Length of the stream in bytes. (default: undefined)
+  streamLength?: number;
   // Reserve space for at least this many splats when constructing the collection
   // initially. The array will automatically resize past maxSplats so setting it is
   // an optional optimization. (default: 0)
@@ -80,11 +80,24 @@ export type PackedSplatsOptions = {
   // Callback function to programmatically create splats at initialization.
   // (default: undefined)
   construct?: (splats: PackedSplats) => Promise<void> | void;
+  // Callback function called while downloading and initializing (default: undefined)
+  onProgress?: (event: ProgressEvent) => void;
   // Additional splat data, such as spherical harmonics components (sh1, sh2, sh3). (default: {})
   extra?: Record<string, unknown>;
   // Override the default splat encoding ranges for the PackedSplats.
   // (default: undefined)
   splatEncoding?: SplatEncoding;
+  // Enable LOD. If a number is provided, it will be used as LoD level base,
+  // otherwise the default 1.5 is used. When loading a file without pre-computed
+  // LoD it will use the "quick lod" algorithm to generate one on-the-fly with
+  // the selected LoD level base. (default: undefined=false)
+  lod?: boolean | "quality";
+  // Keep the original PackedSplats data before creating LoD version. (default: false)
+  nonLod?: boolean;
+  // Only create LoD if the input splat acount is above this
+  lodAbove?: number;
+  // The LoD version of the PackedSplats
+  lodSplats?: PackedSplats;
 };
 
 // A PackedSplats is a collection of Gaussian splats, packed into a format that
@@ -94,12 +107,16 @@ export type PackedSplatsOptions = {
 // and quaternion encoded via axis+angle using 2 x uint8 for octahedral encoding
 // of the axis direction and a uint8 to encode rotation amount from 0..Pi.
 
-export class PackedSplats {
+export class PackedSplats implements SplatSource {
   maxSplats = 0;
   numSplats = 0;
   packedArray: Uint32Array | null = null;
   extra: Record<string, unknown>;
+  maxSh = 3;
   splatEncoding?: SplatEncoding;
+  lod?: boolean | "quality";
+  nonLod?: boolean;
+  lodSplats?: PackedSplats;
 
   initialized: Promise<PackedSplats>;
   isInitialized = false;
@@ -115,9 +132,8 @@ export class PackedSplats {
   // const gsplat = dyno.readPackedSplats(this.dyno, dynoIndex);
   dyno: DynoUniform<typeof TPackedSplats, "packedSplats">;
   dynoRgbMinMaxLnScaleMinMax: DynoUniform<"vec4", "rgbMinMaxLnScaleMinMax">;
-  dynoSh1MinMax: DynoUniform<"vec2", "sh1MinMax">;
-  dynoSh2MinMax: DynoUniform<"vec2", "sh2MinMax">;
-  dynoSh3MinMax: DynoUniform<"vec2", "sh3MinMax">;
+  dynoNumSh: DynoInt<"numSh">;
+  dynoShMax: DynoVec3<THREE.Vector3, "shMax">;
 
   constructor(options: PackedSplatsOptions = {}) {
     this.extra = {};
@@ -135,35 +151,21 @@ export class PackedSplats {
         return value;
       },
     });
-    this.dynoSh1MinMax = new DynoVec2({
-      key: "sh1MinMax",
-      value: new THREE.Vector2(-1, 1),
-      update: (value) => {
-        value.set(
-          this.splatEncoding?.sh1Min ?? -1,
-          this.splatEncoding?.sh1Max ?? 1,
-        );
-        return value;
+    this.dynoNumSh = new DynoInt({
+      key: "numSh",
+      value: 0,
+      update: () => {
+        return Math.min(this.getNumSh(), this.maxSh);
       },
     });
-    this.dynoSh2MinMax = new DynoVec2({
-      key: "sh2MinMax",
-      value: new THREE.Vector2(-1, 1),
+    this.dynoShMax = new DynoVec3({
+      key: "shMax",
+      value: new THREE.Vector3(),
       update: (value) => {
         value.set(
-          this.splatEncoding?.sh2Min ?? -1,
-          this.splatEncoding?.sh2Max ?? 1,
-        );
-        return value;
-      },
-    });
-    this.dynoSh3MinMax = new DynoVec2({
-      key: "sh3MinMax",
-      value: new THREE.Vector2(-1, 1),
-      update: (value) => {
-        value.set(
-          this.splatEncoding?.sh3Min ?? -1,
-          this.splatEncoding?.sh3Max ?? 1,
+          this.splatEncoding?.sh1Max ?? 1.0,
+          this.splatEncoding?.sh2Max ?? 1.0,
+          this.splatEncoding?.sh3Max ?? 1.0,
         );
         return value;
       },
@@ -178,9 +180,17 @@ export class PackedSplats {
     this.isInitialized = false;
 
     this.extra = {};
+    this.maxSplats = options.maxSplats ?? 0;
     this.splatEncoding = options.splatEncoding;
+    this.lod = options.lod;
+    this.nonLod = options.nonLod;
 
-    if (options.url || options.fileBytes || options.construct) {
+    if (
+      options.url ||
+      options.fileBytes ||
+      options.stream ||
+      options.construct
+    ) {
       // We need to initialize asynchronously given the options
       this.initialized = this.asyncInitialize(options).then(() => {
         this.isInitialized = true;
@@ -194,8 +204,14 @@ export class PackedSplats {
   }
 
   initialize(options: PackedSplatsOptions) {
+    this.extra = options.extra ?? {};
+    this.splatEncoding = options.splatEncoding ?? this.splatEncoding;
+    this.lodSplats = options.lodSplats;
+
     if (options.packedArray) {
       this.packedArray = options.packedArray;
+      this.numSplats = options.numSplats ?? this.packedArray.length / 4;
+
       // Calculate number of horizontal texture rows that could fit in array.
       // A properly initialized packedArray should already take into account the
       // width and height of the texture and be rounded up with padding.
@@ -210,23 +226,37 @@ export class PackedSplats {
       this.maxSplats = options.maxSplats ?? 0;
       this.numSplats = 0;
     }
-    this.extra = options.extra ?? {};
   }
 
   async asyncInitialize(options: PackedSplatsOptions) {
-    const { url, fileBytes, construct } = options;
-    if (url) {
-      const loader = new SplatLoader();
-      loader.packedSplats = this;
-      await loader.loadAsync(url);
-    } else if (fileBytes) {
-      const unpacked = await unpackSplats({
-        input: fileBytes,
-        fileType: options.fileType,
-        pathOrUrl: options.fileName ?? url,
-        splatEncoding: options.splatEncoding ?? DEFAULT_SPLAT_ENCODING,
+    const {
+      url,
+      fileBytes,
+      fileType,
+      fileName,
+      stream,
+      streamLength,
+      construct,
+      lod,
+      nonLod,
+      lodAbove,
+    } = options;
+    this.lod = lod;
+    this.nonLod = nonLod;
+
+    const loader = new SplatLoader();
+    if (fileBytes || url || stream) {
+      await loader.loadInternalAsync({
+        packedSplats: this,
+        url,
+        fileBytes,
+        fileType,
+        fileName,
+        stream,
+        streamLength,
+        onProgress: options.onProgress,
+        lodAbove,
       });
-      this.initialize(unpacked);
     }
 
     if (construct) {
@@ -269,6 +299,160 @@ export class PackedSplats {
       }
     }
     this.extra = {};
+
+    this.disposeLodSplats();
+  }
+
+  prepareFetchSplat() {
+    // console.info("PackedSplats.prepareFetchSplat");
+  }
+
+  getNumSplats(): number {
+    return this.numSplats;
+  }
+
+  hasRgbDir(): boolean {
+    return Math.min(this.getNumSh(), this.maxSh) > 0;
+  }
+
+  getNumSh(): number {
+    return !this.extra.sh1 ? 0 : !this.extra.sh2 ? 1 : !this.extra.sh3 ? 2 : 3;
+  }
+
+  setMaxSh(maxSh: number) {
+    this.maxSh = maxSh;
+  }
+
+  fetchSplat({
+    index,
+    viewOrigin,
+  }: { index: DynoVal<"int">; viewOrigin?: DynoVal<"vec3"> }): DynoVal<
+    typeof Gsplat
+  > {
+    let gsplat = readPackedSplat(this.dyno, index);
+
+    if (this.hasRgbDir() && viewOrigin) {
+      const splatCenter = splitGsplat(gsplat).outputs.center;
+      const viewDir = normalize(sub(splatCenter, viewOrigin));
+      const { sh1Texture, sh2Texture, sh3Texture } = this.ensureShTextures();
+      let { rgb } = evaluatePackedSH({
+        coord: splatTexCoord(index),
+        viewDir,
+        numSh: this.dynoNumSh,
+        sh1Texture,
+        sh2Texture,
+        sh3Texture,
+        shMax: this.dynoShMax,
+      });
+      rgb = add(rgb, splitGsplat(gsplat).outputs.rgb);
+      gsplat = combineGsplat({ gsplat, rgb });
+    }
+    return gsplat;
+  }
+
+  private ensureShTextures(): {
+    sh1Texture?: DynoUsampler2DArray<"sh1", THREE.DataArrayTexture>;
+    sh2Texture?: DynoUsampler2DArray<"sh2", THREE.DataArrayTexture>;
+    sh3Texture?: DynoUsampler2DArray<"sh3", THREE.DataArrayTexture>;
+  } {
+    // Ensure we have textures for SH1..SH3 if we have data
+    if (!this.extra.sh1) {
+      return {};
+    }
+
+    let sh1Texture = this.extra.sh1Texture as
+      | DynoUsampler2DArray<"sh1", THREE.DataArrayTexture>
+      | undefined;
+    if (!sh1Texture) {
+      let sh1 = this.extra.sh1 as Uint32Array<ArrayBuffer>;
+      const { width, height, depth, maxSplats } = getTextureSize(
+        sh1.length / 2,
+      );
+      if (sh1.length < maxSplats * 2) {
+        const newSh1 = new Uint32Array(maxSplats * 2);
+        newSh1.set(sh1);
+        this.extra.sh1 = newSh1;
+        sh1 = newSh1;
+      }
+
+      const texture = new THREE.DataArrayTexture(sh1, width, height, depth);
+      texture.format = THREE.RGIntegerFormat;
+      texture.type = THREE.UnsignedIntType;
+      texture.internalFormat = "RG32UI";
+      texture.needsUpdate = true;
+
+      sh1Texture = new DynoUsampler2DArray({
+        value: texture,
+        key: "sh1",
+      });
+      this.extra.sh1Texture = sh1Texture;
+    }
+
+    if (!this.extra.sh2) {
+      return { sh1Texture };
+    }
+
+    let sh2Texture = this.extra.sh2Texture as
+      | DynoUsampler2DArray<"sh2", THREE.DataArrayTexture>
+      | undefined;
+    if (!sh2Texture) {
+      let sh2 = this.extra.sh2 as Uint32Array<ArrayBuffer>;
+      const { width, height, depth, maxSplats } = getTextureSize(
+        sh2.length / 4,
+      );
+      if (sh2.length < maxSplats * 4) {
+        const newSh2 = new Uint32Array(maxSplats * 4);
+        newSh2.set(sh2);
+        this.extra.sh2 = newSh2;
+        sh2 = newSh2;
+      }
+
+      const texture = new THREE.DataArrayTexture(sh2, width, height, depth);
+      texture.format = THREE.RGBAIntegerFormat;
+      texture.type = THREE.UnsignedIntType;
+      texture.internalFormat = "RGBA32UI";
+      texture.needsUpdate = true;
+
+      sh2Texture = new DynoUsampler2DArray({
+        value: texture,
+        key: "sh2",
+      });
+      this.extra.sh2Texture = sh2Texture;
+    }
+
+    if (!this.extra.sh3) {
+      return { sh1Texture, sh2Texture };
+    }
+
+    let sh3Texture = this.extra.sh3Texture as
+      | DynoUsampler2DArray<"sh3", THREE.DataArrayTexture>
+      | undefined;
+    if (!sh3Texture) {
+      let sh3 = this.extra.sh3 as Uint32Array<ArrayBuffer>;
+      const { width, height, depth, maxSplats } = getTextureSize(
+        sh3.length / 4,
+      );
+      if (sh3.length < maxSplats * 4) {
+        const newSh3 = new Uint32Array(maxSplats * 4);
+        newSh3.set(sh3);
+        this.extra.sh3 = newSh3;
+        sh3 = newSh3;
+      }
+
+      const texture = new THREE.DataArrayTexture(sh3, width, height, depth);
+      texture.format = THREE.RGBAIntegerFormat;
+      texture.type = THREE.UnsignedIntType;
+      texture.internalFormat = "RGBA32UI";
+      texture.needsUpdate = true;
+
+      sh3Texture = new DynoUsampler2DArray({
+        value: texture,
+        key: "sh3",
+      });
+      this.extra.sh3Texture = sh3Texture;
+    }
+
+    return { sh1Texture, sh2Texture, sh3Texture };
   }
 
   // Ensures that this.packedArray can fit numSplats Gsplats. If it's too small,
@@ -509,7 +693,7 @@ export class PackedSplats {
       return source;
     }
 
-    return PackedSplats.getEmpty();
+    return PackedSplats.getEmptyArray;
   }
 
   // Check if source texture needs to be created/updated
@@ -533,7 +717,7 @@ export class PackedSplats {
         // Allocate a new source texture of the right size
         const { width, height, depth } = getTextureSize(this.maxSplats);
         this.source = new THREE.DataArrayTexture(
-          this.packedArray,
+          this.packedArray as Uint32Array<ArrayBuffer>,
           width,
           height,
           depth,
@@ -552,27 +736,21 @@ export class PackedSplats {
     return this.source;
   }
 
-  private static emptySource: THREE.DataArrayTexture | null = null;
-
-  // Can be used where you need an uninitialized THREE.DataArrayTexture like
-  // a uniform you will update with the result of this.getTexture() later.
-  static getEmpty(): THREE.DataArrayTexture {
-    if (!PackedSplats.emptySource) {
-      const { width, height, depth, maxSplats } = getTextureSize(1);
-      const emptyArray = new Uint32Array(maxSplats * 4);
-      PackedSplats.emptySource = new THREE.DataArrayTexture(
-        emptyArray,
-        width,
-        height,
-        depth,
-      );
-      PackedSplats.emptySource.format = THREE.RGBAIntegerFormat;
-      PackedSplats.emptySource.type = THREE.UnsignedIntType;
-      PackedSplats.emptySource.internalFormat = "RGBA32UI";
-      PackedSplats.emptySource.needsUpdate = true;
-    }
-    return PackedSplats.emptySource;
-  }
+  static getEmptyArray = (() => {
+    const { width, height, depth, maxSplats } = getTextureSize(1);
+    const emptyArray = new Uint32Array(maxSplats * 4);
+    const texture = new THREE.DataArrayTexture(
+      emptyArray,
+      width,
+      height,
+      depth,
+    );
+    texture.format = THREE.RGBAIntegerFormat;
+    texture.type = THREE.UnsignedIntType;
+    texture.internalFormat = "RGBA32UI";
+    texture.needsUpdate = true;
+    return texture;
+  })();
 
   // Get a program and THREE.RawShaderMaterial for a given GsplatGenerator,
   // generating it if necessary and caching the result.
@@ -585,15 +763,16 @@ export class PackedSplats {
       // A Gsplat needs to be turned into a packed uvec4 for the dyno graph
       const graph = dynoBlock(
         { index: "int" },
-        { output: "uvec4" },
-        ({ index }) => {
+        {},
+        ({ index }, _outputs, { roots }) => {
           generator.inputs.index = index;
           const gsplat = generator.outputs.gsplat;
           const output = outputPackedSplat(
             gsplat,
             this.dynoRgbMinMaxLnScaleMinMax,
           );
-          return { output };
+          roots.push(output);
+          return undefined;
         },
       );
       if (!PackedSplats.programTemplate) {
@@ -604,7 +783,7 @@ export class PackedSplats {
       // Create a program from the template and graph
       program = new DynoProgram({
         graph,
-        inputs: { index: "index" },
+        inputs: { index: "_index" },
         outputs: { output: "target" },
         template: PackedSplats.programTemplate,
       });
@@ -624,6 +803,7 @@ export class PackedSplats {
 
   private saveRenderState(renderer: THREE.WebGLRenderer) {
     return {
+      target: renderer.getRenderTarget(),
       xrEnabled: renderer.xr.enabled,
       autoClear: renderer.autoClear,
     };
@@ -632,11 +812,12 @@ export class PackedSplats {
   private resetRenderState(
     renderer: THREE.WebGLRenderer,
     state: {
+      target: THREE.WebGLRenderTarget | null;
       xrEnabled: boolean;
       autoClear: boolean;
     },
   ) {
-    renderer.setRenderTarget(null);
+    renderer.setRenderTarget(state.target);
     renderer.xr.enabled = state.xrEnabled;
     renderer.autoClear = state.autoClear;
   }
@@ -708,6 +889,85 @@ export class PackedSplats {
     return { nextBase };
   }
 
+  disposeLodSplats() {
+    if (this.lodSplats) {
+      this.lodSplats.dispose();
+      this.lodSplats = undefined;
+    }
+  }
+
+  async createLodSplats({
+    rgbaArray,
+    quality,
+  }: { rgbaArray?: RgbaArray; quality?: boolean } = {}) {
+    const lodBase =
+      typeof this.lod === "number"
+        ? Math.max(1.1, Math.min(2.0, this.lod))
+        : quality
+          ? 1.75
+          : 1.5;
+    const packedArray = (this.packedArray as Uint32Array).slice();
+    const rgba = rgbaArray ? (await rgbaArray.getArray()).slice() : undefined;
+    const extra = {
+      sh1: this.extra.sh1 ? (this.extra.sh1 as Uint32Array).slice() : undefined,
+      sh2: this.extra.sh2 ? (this.extra.sh2 as Uint32Array).slice() : undefined,
+      sh3: this.extra.sh3 ? (this.extra.sh3 as Uint32Array).slice() : undefined,
+    };
+    const decoded = await workerPool.withWorker(async (worker) => {
+      return (await worker.call(
+        quality ? "qualityLodPackedSplats" : "tinyLodPackedSplats",
+        {
+          numSplats: this.numSplats,
+          packedArray,
+          extra,
+          lodBase,
+          rgba,
+          encoding: this.splatEncoding ?? DEFAULT_SPLAT_ENCODING,
+        },
+      )) as {
+        numSplats: number;
+        packedArray: Uint32Array;
+        extra: Record<string, unknown>;
+        splatEncoding: SplatEncoding;
+      };
+    });
+
+    const lodSplats = new PackedSplats(decoded);
+    if (this.lodSplats) {
+      this.lodSplats.dispose();
+    }
+
+    this.lodSplats = lodSplats;
+    this.nonLod = true;
+    this.lod = quality ? "quality" : true;
+  }
+
+  extractSplats(indices: Uint32Array, pageColoring: boolean) {
+    const maxSplats = getTextureSize(indices.length).maxSplats;
+    const newSplats = new PackedSplats({ maxSplats });
+    for (let i = 0; i < indices.length; i++) {
+      const splat = this.getSplat(indices[i]);
+      if (pageColoring) {
+        let hue = (indices[i] >>> 16) * 0.61803398875;
+        hue = hue - Math.floor(hue);
+        const r = Math.max(0, Math.min(1, Math.abs(hue * 6.0 - 3.0) - 1.0));
+        const g = Math.max(0, Math.min(1, Math.abs(hue * 6.0 + 1.0) - 1.0));
+        const b = Math.max(0, Math.min(1, Math.abs(hue * 6.0 - 1.0) - 1.0));
+        splat.color.r *= r;
+        splat.color.g *= g;
+        splat.color.b *= b;
+      }
+      newSplats.pushSplat(
+        splat.center,
+        splat.scales,
+        splat.quaternion,
+        splat.opacity,
+        splat.color,
+      );
+    }
+    return newSplats;
+  }
+
   static programTemplate: DynoProgramTemplate | null = null;
 
   // Cache for GsplatGenerator programs
@@ -717,6 +977,38 @@ export class PackedSplats {
   static fullScreenQuad = new FullScreenQuad(
     new THREE.RawShaderMaterial({ visible: false }),
   );
+
+  static emptyUint32x4 = (() => {
+    const { width, height, depth, maxSplats } = getTextureSize(1);
+    const emptyArray = new Uint32Array(maxSplats * 4);
+    const texture = new THREE.DataArrayTexture(
+      emptyArray,
+      width,
+      height,
+      depth,
+    );
+    texture.format = THREE.RGBAIntegerFormat;
+    texture.type = THREE.UnsignedIntType;
+    texture.internalFormat = "RGBA32UI";
+    texture.needsUpdate = true;
+    return texture;
+  })();
+
+  static emptyUint32x2 = (() => {
+    const { width, height, depth, maxSplats } = getTextureSize(1);
+    const emptyArray = new Uint32Array(maxSplats * 2);
+    const texture = new THREE.DataArrayTexture(
+      emptyArray,
+      width,
+      height,
+      depth,
+    );
+    texture.format = THREE.RGIntegerFormat;
+    texture.type = THREE.UnsignedIntType;
+    texture.internalFormat = "RG32UI";
+    texture.needsUpdate = true;
+    return texture;
+  })();
 }
 
 // You can use a PackedSplats as a dyno block using the function
@@ -733,9 +1025,10 @@ export class DynoPackedSplats extends DynoUniform<
   typeof TPackedSplats,
   "packedSplats",
   {
-    texture: THREE.DataArrayTexture;
+    textureArray: THREE.DataArrayTexture;
     numSplats: number;
     rgbMinMaxLnScaleMinMax: THREE.Vector4;
+    lodOpacity: boolean;
   }
 > {
   packedSplats?: PackedSplats;
@@ -746,7 +1039,7 @@ export class DynoPackedSplats extends DynoUniform<
       type: TPackedSplats,
       globals: () => [definePackedSplats],
       value: {
-        texture: PackedSplats.getEmpty(),
+        textureArray: PackedSplats.getEmptyArray,
         numSplats: 0,
         rgbMinMaxLnScaleMinMax: new THREE.Vector4(
           0,
@@ -754,10 +1047,11 @@ export class DynoPackedSplats extends DynoUniform<
           LN_SCALE_MIN,
           LN_SCALE_MAX,
         ),
+        lodOpacity: false,
       },
       update: (value) => {
-        value.texture =
-          this.packedSplats?.getTexture() ?? PackedSplats.getEmpty();
+        value.textureArray =
+          this.packedSplats?.getTexture() ?? PackedSplats.getEmptyArray;
         value.numSplats = this.packedSplats?.numSplats ?? 0;
         value.rgbMinMaxLnScaleMinMax.set(
           this.packedSplats?.splatEncoding?.rgbMin ?? 0,
@@ -765,9 +1059,212 @@ export class DynoPackedSplats extends DynoUniform<
           this.packedSplats?.splatEncoding?.lnScaleMin ?? LN_SCALE_MIN,
           this.packedSplats?.splatEncoding?.lnScaleMax ?? LN_SCALE_MAX,
         );
+        value.lodOpacity =
+          this.packedSplats?.splatEncoding?.lodOpacity ?? false;
         return value;
       },
     });
     this.packedSplats = packedSplats;
   }
+}
+
+export const defineEvalPackedSH1 = unindent(`
+  vec3 evaluatePackedSH1(uvec2 packedData, vec3 viewDir, float sh1Max) {
+    // Extract sint7 values packed into 2 x uint32
+    vec3 sh1_0 = vec3(ivec3(
+      int(packedData.x << 25u) >> 25,
+      int(packedData.x << 18u) >> 25,
+      int(packedData.x << 11u) >> 25
+    ));
+    vec3 sh1_1 = vec3(ivec3(
+      int(packedData.x << 4u) >> 25,
+      int((packedData.x >> 3u) | (packedData.y << 29u)) >> 25,
+      int(packedData.y << 22u) >> 25
+    ));
+    vec3 sh1_2 = vec3(ivec3(
+      int(packedData.y << 15u) >> 25,
+      int(packedData.y << 8u) >> 25,
+      int(packedData.y << 1u) >> 25
+    ));
+
+    vec3 rgb = sh1_0 * (-0.4886025 * viewDir.y)
+      + sh1_1 * (0.4886025 * viewDir.z)
+      + sh1_2 * (-0.4886025 * viewDir.x);
+    return rgb * (sh1Max / 63.0);
+  }
+`);
+
+export const defineEvalPackedSH2 = unindent(`
+  vec3 evaluatePackedSH2(uvec4 packedData, vec3 viewDir, float sh2Max) {
+    // Extract sint8 values packed into 4 x uint32
+    vec3 sh2_0 = vec3(ivec3(
+      int(packedData.x << 24u) >> 24,
+      int(packedData.x << 16u) >> 24,
+      int(packedData.x << 8u) >> 24
+    ));
+    vec3 sh2_1 = vec3(ivec3(
+      int(packedData.x) >> 24,
+      int(packedData.y << 24u) >> 24,
+      int(packedData.y << 16u) >> 24
+    ));
+    vec3 sh2_2 = vec3(ivec3(
+      int(packedData.y << 8u) >> 24,
+      int(packedData.y) >> 24,
+      int(packedData.z << 24u) >> 24
+    ));
+    vec3 sh2_3 = vec3(ivec3(
+      int(packedData.z << 16u) >> 24,
+      int(packedData.z << 8u) >> 24,
+      int(packedData.z) >> 24
+    ));
+    vec3 sh2_4 = vec3(ivec3(
+      int(packedData.w << 24u) >> 24,
+      int(packedData.w << 16u) >> 24,
+      int(packedData.w << 8u) >> 24
+    ));
+
+    vec3 rgb = sh2_0 * (1.0925484 * viewDir.x * viewDir.y)
+      + sh2_1 * (-1.0925484 * viewDir.y * viewDir.z)
+      + sh2_2 * (0.3153915 * (2.0 * viewDir.z * viewDir.z - viewDir.x * viewDir.x - viewDir.y * viewDir.y))
+      + sh2_3 * (-1.0925484 * viewDir.x * viewDir.z)
+      + sh2_4 * (0.5462742 * (viewDir.x * viewDir.x - viewDir.y * viewDir.y));
+    return rgb * (sh2Max / 127.0);
+  }
+`);
+
+export const defineEvalPackedSH3 = unindent(`
+  vec3 evaluatePackedSH3(uvec4 packedData, vec3 viewDir, float sh3Max) {
+    // Extract sint6 values packed into 4 x uint32
+    vec3 sh3_0 = vec3(ivec3(
+      int(packedData.x << 26u) >> 26,
+      int(packedData.x << 20u) >> 26,
+      int(packedData.x << 14u) >> 26
+    ));
+    vec3 sh3_1 = vec3(ivec3(
+      int(packedData.x << 8u) >> 26,
+      int(packedData.x << 2u) >> 26,
+      int((packedData.x >> 4u) | (packedData.y << 28u)) >> 26
+    ));
+    vec3 sh3_2 = vec3(ivec3(
+      int(packedData.y << 22u) >> 26,
+      int(packedData.y << 16u) >> 26,
+      int(packedData.y << 10u) >> 26
+    ));
+    vec3 sh3_3 = vec3(ivec3(
+      int(packedData.y << 4u) >> 26,
+      int((packedData.y >> 2u) | (packedData.z << 30u)) >> 26,
+      int(packedData.z << 24u) >> 26
+    ));
+    vec3 sh3_4 = vec3(ivec3(
+      int(packedData.z << 18u) >> 26,
+      int(packedData.z << 12u) >> 26,
+      int(packedData.z << 6u) >> 26
+    ));
+    vec3 sh3_5 = vec3(ivec3(
+      int(packedData.z) >> 26,
+      int(packedData.w << 26u) >> 26,
+      int(packedData.w << 20u) >> 26
+    ));
+    vec3 sh3_6 = vec3(ivec3(
+      int(packedData.w << 14u) >> 26,
+      int(packedData.w << 8u) >> 26,
+      int(packedData.w << 2u) >> 26
+    ));
+
+    float xx = viewDir.x * viewDir.x;
+    float yy = viewDir.y * viewDir.y;
+    float zz = viewDir.z * viewDir.z;
+    float xy = viewDir.x * viewDir.y;
+    float yz = viewDir.y * viewDir.z;
+    float zx = viewDir.z * viewDir.x;
+
+    vec3 rgb = sh3_0 * (-0.5900436 * viewDir.y * (3.0 * xx - yy))
+      + sh3_1 * (2.8906114 * xy * viewDir.z) +
+      + sh3_2 * (-0.4570458 * viewDir.y * (4.0 * zz - xx - yy))
+      + sh3_3 * (0.3731763 * viewDir.z * (2.0 * zz - 3.0 * xx - 3.0 * yy))
+      + sh3_4 * (-0.4570458 * viewDir.x * (4.0 * zz - xx - yy))
+      + sh3_5 * (1.4453057 * viewDir.z * (xx - yy))
+      + sh3_6 * (-0.5900436 * viewDir.x * (xx - 3.0 * yy));
+    return rgb * (sh3Max / 31.0);
+  }
+`);
+
+export function evaluatePackedSH({
+  coord,
+  viewDir,
+  numSh,
+  sh1Texture,
+  sh2Texture,
+  sh3Texture,
+  shMax,
+}: {
+  coord: DynoVal<"ivec3">;
+  viewDir: DynoVal<"vec3">;
+  numSh: DynoVal<"int">;
+  sh1Texture?: DynoUsampler2DArray<"sh1", THREE.DataArrayTexture>;
+  sh2Texture?: DynoUsampler2DArray<"sh2", THREE.DataArrayTexture>;
+  sh3Texture?: DynoUsampler2DArray<"sh3", THREE.DataArrayTexture>;
+  shMax: DynoVal<"vec3">;
+}) {
+  return new Dyno({
+    inTypes: {
+      coord: "ivec3",
+      viewDir: "vec3",
+      numSh: "int",
+      sh1Texture: "usampler2DArray",
+      sh2Texture: "usampler2DArray",
+      sh3Texture: "usampler2DArray",
+      shMax: "vec3",
+    },
+    outTypes: { rgb: "vec3" },
+    inputs: {
+      coord,
+      viewDir,
+      numSh,
+      sh1Texture,
+      sh2Texture,
+      sh3Texture,
+      shMax,
+    },
+    globals: () => [
+      defineEvalPackedSH1,
+      defineEvalPackedSH2,
+      defineEvalPackedSH3,
+    ],
+    statements: ({ inputs, outputs }) => {
+      const lines = ["vec3 rgb = vec3(0.0);"];
+      if (inputs.sh1Texture) {
+        lines.push(
+          ...unindentLines(`
+          if (${inputs.numSh} >= 1) {
+            vec3 sh1Rgb = evaluatePackedSH1(texelFetch(${inputs.sh1Texture}, ${inputs.coord}, 0).rg, ${inputs.viewDir}, ${inputs.shMax}.x);
+            rgb += sh1Rgb;
+          `),
+        );
+        if (inputs.sh2Texture) {
+          lines.push(
+            ...unindentLines(`
+            if (${inputs.numSh} >= 2) {
+              vec3 sh2Rgb = evaluatePackedSH2(texelFetch(${inputs.sh2Texture}, ${inputs.coord}, 0), ${inputs.viewDir}, ${inputs.shMax}.y);
+              rgb += sh2Rgb;
+            `),
+          );
+          if (inputs.sh3Texture) {
+            lines.push(
+              ...unindentLines(`
+              if (${inputs.numSh} >= 3) {
+                vec3 sh3Rgb = evaluatePackedSH3(texelFetch(${inputs.sh3Texture}, ${inputs.coord}, 0), ${inputs.viewDir}, ${inputs.shMax}.z);
+                rgb += sh3Rgb;
+              }
+            `),
+            );
+          }
+          lines.push("}");
+        }
+        lines.push("}");
+      }
+      lines.push(`${outputs.rgb} = rgb;`);
+      return lines;
+    },
+  }).outputs;
 }

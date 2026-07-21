@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { isAndroid, isIos } from "./utils";
 
 // Spark controls for keyboard + mouse, game pad, or mobile multi-touch
 
@@ -12,14 +13,19 @@ const DEFAULT_ROTATE_INERTIA = 0.15;
 const DEFAULT_MOVE_INERTIA = 0.15;
 const DEFAULT_STICK_THRESHOLD = 0.1;
 const DEFAULT_FPS_ROTATE_SPEED = 2.0;
-const DEFAULT_POINTER_ROLL_SCALE = 1.0;
+// const DEFAULT_POINTER_ROLL_SCALE = 1.0;
+const DEFAULT_POINTER_ROLL_SCALE = 0.0;
+const DEFAULT_PRESS_MOVE_DELAY_MS = 500;
+const DEFAULT_PRESS_MOVE_ACCEL_MS = 500;
 
 // Time limit for double-finger press (pinch etc)
 const DUAL_PRESS_MS = 200;
 // Time limit for double-click/double-tap
 const DOUBLE_PRESS_LIMIT_MS = 400;
 // Distance limit for double-click.
-const DOUBLE_PRESS_DISTANCE = 50;
+const DOUBLE_PRESS_DISTANCE = 25;
+
+const MOVEMENT_THRESHOLD = 1.0e-4;
 
 // Standard WASD movement keys with R+F for up/down
 const WASD_KEYCODE_MOVE = {
@@ -27,8 +33,8 @@ const WASD_KEYCODE_MOVE = {
   KeyS: new THREE.Vector3(0, 0, 1),
   KeyA: new THREE.Vector3(-1, 0, 0),
   KeyD: new THREE.Vector3(1, 0, 0),
-  KeyR: new THREE.Vector3(0, 1, 0),
-  KeyF: new THREE.Vector3(0, -1, 0),
+  KeyE: new THREE.Vector3(0, 1, 0),
+  KeyQ: new THREE.Vector3(0, -1, 0),
 };
 
 // Arrow key movement with PageUp/PageDown
@@ -69,13 +75,16 @@ export class SparkControls {
     this.pointerControls = new PointerControls({ canvas });
   }
 
-  update(control: THREE.Object3D) {
+  update(control: THREE.Object3D, camera?: THREE.Camera) {
     const time = performance.now();
     const deltaTime = (time - (this.lastTime || time)) / 1000;
     this.lastTime = time;
 
-    this.fpsMovement.update(deltaTime, control);
-    this.pointerControls.update(deltaTime, control);
+    let updated = this.fpsMovement.update(deltaTime, control);
+    if (this.pointerControls.update(deltaTime, control, camera)) {
+      updated = true;
+    }
+    return updated;
   }
 }
 
@@ -105,6 +114,7 @@ export class FpsMovement {
   xr?: THREE.WebXRManager;
   // Enable/disable controls updates
   enable = true;
+  extraMove = new THREE.Vector3();
 
   // Currently active event.key values
   keydown: { [key: string]: boolean };
@@ -136,7 +146,7 @@ export class FpsMovement {
     // (default {...WASD_KEYCODE_MOVE, ...ARROW_KEYCODE_MOVE})
     keycodeMoveMapping?: { [key: string]: THREE.Vector3 };
     // Maps keyboard keys to rotation directions
-    // (default {...QE_KEYCODE_ROTATE, ...ARROW_KEYCODE_ROTATE})
+    // (default { ...ARROW_KEYCODE_ROTATE})
     keycodeRotateMapping?: { [key: string]: THREE.Vector3 };
     // Maps gamepad buttons to control actions
     // (default {4: "rollLeft", 5: "rollRight", 6: "ctrl", 7: "shift"})
@@ -161,7 +171,7 @@ export class FpsMovement {
       ...ARROW_KEYCODE_MOVE,
     };
     this.keycodeRotateMapping = keycodeRotateMapping ?? {
-      ...QE_KEYCODE_ROTATE,
+      // ...QE_KEYCODE_ROTATE,
       ...ARROW_KEYCODE_ROTATE,
     };
     this.gamepadMapping = gamepadMapping ?? {
@@ -198,7 +208,7 @@ export class FpsMovement {
   // in seconds since the last update.
   update(deltaTime: number, control: THREE.Object3D) {
     if (!this.enable) {
-      return;
+      return false;
     }
 
     // Update gamepad / XR controllers
@@ -273,6 +283,8 @@ export class FpsMovement {
       new THREE.Vector3(this.rotateSpeed, this.rotateSpeed, this.rollSpeed),
     );
 
+    let updated = rotate.length() > MOVEMENT_THRESHOLD;
+
     if (rotate.manhattanLength() > 0.0) {
       rotate.multiplyScalar(deltaTime);
       const eulers = new THREE.Euler().setFromQuaternion(
@@ -291,6 +303,7 @@ export class FpsMovement {
     // Movement
 
     const moveVector = new THREE.Vector3(sticks[0].x, 0, sticks[0].y);
+    moveVector.add(this.extraMove);
 
     for (const [keycode, move] of Object.entries(this.keycodeMoveMapping)) {
       if (this.keycode[keycode]) {
@@ -321,11 +334,17 @@ export class FpsMovement {
       }
     }
 
+    if (moveVector.length() > MOVEMENT_THRESHOLD) {
+      updated = true;
+    }
+
     // Apply movement in view direction
     moveVector.applyQuaternion(control.quaternion);
     control.position.add(
       moveVector.multiplyScalar(this.moveSpeed * speedMultiplier * deltaTime),
     );
+
+    return updated;
   }
 }
 
@@ -365,13 +384,32 @@ export class PointerControls {
   doublePressLimitMs: number;
   // Distance limit for double press (default DOUBLE_PRESS_DISTANCE)
   doublePressDistance: number;
+
+  // Time delay in ms for press move to start
+  pressMoveDelayMs: number;
+  // Time in ms for press move to accelerate
+  pressMoveAccelMs: number;
+  // Speed of movement on press (default: 0)
+  pressMoveSpeed: number;
+  // Speed of movement on double press (default: pressMoveSpeed * 5.0)
+  doublePressMoveSpeed: number;
+  // Speed of movement on triple press (default: doublePressMoveSpeed * 5.0)
+  triplePressMoveSpeed: number;
+  // Whether to move toward the screen center or finger when pressing to move
+  pressMoveCenter: boolean;
+  pressHeld?: boolean;
+  doublePressed?: number;
+  triplePressed: boolean;
   // Last pointer up event (default: null)
-  lastUp: { position: THREE.Vector2; time: number } | null;
+  lastUp: { position: THREE.Vector2; timeStamp: number } | null;
+  lastLastUp: { position: THREE.Vector2; timeStamp: number } | null;
 
   // Pointer state for currently active rotating pointer
   rotating: PointerState | null;
   // Pointer state for currently active sliding pointer
   sliding: PointerState | null;
+  // Pointer state for last pointer that downed
+  lastDown: PointerState | null;
   // Whether we pressed two pointers at the same time
   dualPress: boolean;
   // Cumulative scroll movement
@@ -410,6 +448,18 @@ export class PointerControls {
     pointerRollScale,
     // Callback for double press events (default: () => {})
     doublePress,
+    // Time delay in ms for press move to start (default: DEFAULT_PRESS_MOVE_DELAY_MS)
+    pressMoveDelayMs,
+    // Time in ms for press move to accelerate (default: DEFAULT_PRESS_MOVE_ACCEL_MS)
+    pressMoveAccelMs,
+    // Speed of movement on press (default: 0)
+    pressMoveSpeed,
+    // Speed of movement on double press (default: pressMoveSpeed * 5.0)
+    doublePressMoveSpeed,
+    // Speed of movement on triple press (default: doublePressMoveSpeed * 5.0)
+    triplePressMoveSpeed,
+    // Whether to move toward the screen center or finger when pressing to move (default: true)
+    pressMoveCenter,
   }: {
     canvas: HTMLCanvasElement;
     rotateSpeed?: number;
@@ -427,13 +477,19 @@ export class PointerControls {
       position,
       intervalMs,
     }: { position: THREE.Vector2; intervalMs: number }) => void;
+    pressMoveDelayMs?: number;
+    pressMoveAccelMs?: number;
+    pressMoveSpeed?: number;
+    doublePressMoveSpeed?: number;
+    triplePressMoveSpeed?: number;
+    pressMoveCenter?: boolean;
   }) {
     this.canvas = canvas;
     this.rotateSpeed = rotateSpeed ?? DEFAULT_ROTATE_SPEED;
     this.slideSpeed = slideSpeed ?? DEFAULT_SLIDE_SPEED;
     this.scrollSpeed = scrollSpeed ?? DEFAULT_SCROLL_SPEED;
     this.swapRotateSlide = swapRotateSlide ?? false;
-    this.reverseRotate = reverseRotate ?? false;
+    this.reverseRotate = reverseRotate ?? (isAndroid() || isIos());
     this.reverseSlide = reverseSlide ?? false;
     this.reverseSwipe = reverseSwipe ?? false;
     this.reverseScroll = reverseScroll ?? false;
@@ -444,10 +500,23 @@ export class PointerControls {
     this.doublePress = doublePress ?? (() => {});
     this.doublePressLimitMs = DOUBLE_PRESS_LIMIT_MS;
     this.doublePressDistance = DOUBLE_PRESS_DISTANCE;
+
+    this.pressMoveDelayMs = pressMoveDelayMs ?? DEFAULT_PRESS_MOVE_DELAY_MS;
+    this.pressMoveAccelMs = pressMoveAccelMs ?? DEFAULT_PRESS_MOVE_ACCEL_MS;
+    this.pressMoveSpeed = pressMoveSpeed ?? 0;
+    this.doublePressMoveSpeed =
+      doublePressMoveSpeed ?? this.pressMoveSpeed * 5.0;
+    this.triplePressMoveSpeed =
+      triplePressMoveSpeed ?? this.doublePressMoveSpeed * 5.0;
+    this.pressMoveCenter = pressMoveCenter ?? true;
+    this.doublePressed = undefined;
+    this.triplePressed = false;
     this.lastUp = null;
+    this.lastLastUp = null;
 
     this.rotating = null;
     this.sliding = null;
+    this.lastDown = null;
     this.dualPress = false;
     this.scroll = new THREE.Vector3();
 
@@ -470,10 +539,12 @@ export class PointerControls {
           (event.pointerType !== "mouse" || event.button === 1));
       // const isRotate =
       //   !this.rotating && (event.pointerType !== "mouse" || event.button === 0);
-      const { pointerId, timeStamp } = event;
+      const { pointerId } = event;
+      const timeStamp = performance.now();
 
       if (isRotate) {
         this.rotating = { initial, last, position, pointerId, timeStamp };
+        this.lastDown = this.rotating;
         // Capture the pointer so events continue to be delivered even if it leaves the canvas.
         canvas.setPointerCapture(event.pointerId);
 
@@ -490,6 +561,7 @@ export class PointerControls {
           button,
           timeStamp,
         };
+        this.lastDown = this.sliding;
         // Capture the pointer so events continue to be delivered even if it leaves the canvas.
         canvas.setPointerCapture(event.pointerId);
 
@@ -497,6 +569,32 @@ export class PointerControls {
         this.dualPress =
           this.rotating != null &&
           timeStamp - this.rotating.timeStamp < DUAL_PRESS_MS;
+      }
+
+      if (this.lastUp) {
+        const distance = this.lastUp.position.distanceTo(position);
+        const intervalMs = timeStamp - this.lastUp.timeStamp;
+        if (
+          distance < this.doublePressDistance &&
+          intervalMs < this.doublePressLimitMs
+        ) {
+          this.doublePressed = performance.now();
+          this.triplePressed = false;
+
+          if (this.lastLastUp) {
+            const lastDistance = this.lastLastUp.position.distanceTo(
+              this.lastUp.position,
+            );
+            const lastIntervalMs =
+              this.lastUp.timeStamp - this.lastLastUp.timeStamp;
+            if (
+              lastDistance < this.doublePressDistance &&
+              lastIntervalMs < this.doublePressLimitMs
+            ) {
+              this.triplePressed = true;
+            }
+          }
+        }
       }
     });
 
@@ -517,16 +615,22 @@ export class PointerControls {
         }
       }
 
+      this.doublePressed = undefined;
+      this.triplePressed = false;
+
       const position = this.getPointerPosition(event);
       const lastUp = this.lastUp;
-      this.lastUp = { position, time: event.timeStamp };
+      this.lastLastUp = this.lastUp;
+      const timeStamp = performance.now();
+      this.lastUp = { position, timeStamp };
+
       if (lastUp) {
         const distance = lastUp.position.distanceTo(position);
         if (distance < this.doublePressDistance) {
-          const intervalMs = event.timeStamp - lastUp.time;
+          const intervalMs = timeStamp - lastUp.timeStamp;
           if (intervalMs < this.doublePressLimitMs) {
             // We pressed and release twice within the time and distance limits
-            this.lastUp = null;
+            // this.lastUp = null;
             this.doublePress({ position, intervalMs });
           }
         }
@@ -565,10 +669,13 @@ export class PointerControls {
     );
   }
 
-  update(deltaTime: number, control: THREE.Object3D) {
+  update(deltaTime: number, control: THREE.Object3D, camera?: THREE.Camera) {
     if (!this.enable) {
-      return;
+      return false;
     }
+
+    const now = performance.now();
+    let updated = false;
 
     if (this.dualPress && this.rotating && this.sliding) {
       // We pressed both pointers at the same time, either pinching or sliding
@@ -586,6 +693,10 @@ export class PointerControls {
         slide.applyQuaternion(control.quaternion);
         control.position.add(slide);
         this.moveVelocity = slide.clone().multiplyScalar(1 / deltaTime);
+
+        if (slide.length() > MOVEMENT_THRESHOLD) {
+          updated = true;
+        }
       } else if (coincidence <= -0.2) {
         // Opposite directions so either pinch or roll motion
         const deltaDir = this.sliding.last.clone().sub(this.rotating.last);
@@ -602,19 +713,25 @@ export class PointerControls {
           .add(this.sliding.last)
           .multiplyScalar(0.5);
         let midpointDir = new THREE.Vector3();
-        if (control instanceof THREE.Camera) {
+        const theCamera =
+          camera ?? (control instanceof THREE.Camera ? control : undefined);
+        if (theCamera) {
           const ndcMidpoint = new THREE.Vector2(
             (midpoint.x / this.canvas.clientWidth) * 2 - 1,
             -(midpoint.y / this.canvas.clientHeight) * 2 + 1,
           );
           const raycaster = new THREE.Raycaster();
-          raycaster.setFromCamera(ndcMidpoint, control);
+          raycaster.setFromCamera(ndcMidpoint, theCamera);
           midpointDir = raycaster.ray.direction;
         }
         const pinchOut = motionDir[1] - motionDir[0];
         const slide = midpointDir.multiplyScalar(pinchOut * this.slideSpeed);
         control.position.add(slide);
         this.moveVelocity = slide.clone().multiplyScalar(1 / deltaTime);
+
+        if (slide.length() > MOVEMENT_THRESHOLD) {
+          updated = true;
+        }
 
         // Rolling motion
         // Calculate angle of orthogonal motion change over distance deltaDist/2
@@ -633,6 +750,10 @@ export class PointerControls {
           Math.min(Math.PI, eulers.z + 0.5 * rotate),
         );
         control.quaternion.setFromEuler(eulers);
+
+        if (Math.abs(rotate) > MOVEMENT_THRESHOLD) {
+          updated = true;
+        }
       }
 
       this.rotating.last.copy(this.rotating.position);
@@ -648,12 +769,20 @@ export class PointerControls {
         rotate.multiplyScalar(this.rotateSpeed * (this.reverseRotate ? -1 : 1));
         // Update rotation velocity from last delta
         this.rotateVelocity = rotate.clone().multiplyScalar(1 / deltaTime);
+
+        if (rotate.length() > MOVEMENT_THRESHOLD) {
+          updated = true;
+        }
       } else {
         // Continue to rotate with inertia
         this.rotateVelocity.multiplyScalar(
           Math.exp(-deltaTime / this.rotateInertia),
         );
         rotate.addScaledVector(this.rotateVelocity, deltaTime);
+
+        if (this.rotateVelocity.length() * 0.1 > MOVEMENT_THRESHOLD) {
+          updated = true;
+        }
       }
 
       // Apply rotation in Euler angles space
@@ -684,12 +813,80 @@ export class PointerControls {
         control.position.add(slide);
         // Update movement velocity from last delta
         this.moveVelocity = slide.clone().multiplyScalar(1 / deltaTime);
+
+        if (slide.length() > MOVEMENT_THRESHOLD) {
+          updated = true;
+        }
       } else {
+        const target = new THREE.Vector3();
+        if (this.sliding || this.rotating) {
+          const point = this.lastDown?.last ?? new THREE.Vector2();
+          const theCamera =
+            camera ?? (control instanceof THREE.Camera ? control : undefined);
+          if (theCamera) {
+            const ndcPoint = this.pressMoveCenter
+              ? new THREE.Vector2(0, 0)
+              : new THREE.Vector2(
+                  (point.x / this.canvas.clientWidth) * 2 - 1,
+                  -(point.y / this.canvas.clientHeight) * 2 + 1,
+                );
+            const raycaster = new THREE.Raycaster();
+            raycaster.setFromCamera(ndcPoint, theCamera);
+            target.copy(raycaster.ray.direction).normalize();
+          }
+
+          if (!this.doublePressed) {
+            let intensity = 0;
+            if (this.lastDown) {
+              intensity =
+                (now -
+                  (this.lastDown?.timeStamp ?? now) -
+                  this.pressMoveDelayMs) /
+                this.pressMoveAccelMs;
+
+              if (
+                this.lastDown.position.distanceTo(this.lastDown.initial) <
+                this.doublePressDistance
+              ) {
+                if (this.pressHeld === undefined) {
+                  if (intensity > 0) {
+                    this.pressHeld = true;
+                  }
+                }
+              } else if (this.pressHeld === undefined) {
+                this.pressHeld = false;
+              }
+            }
+
+            if (this.pressHeld) {
+              target.multiplyScalar(
+                this.pressMoveSpeed * Math.max(0, Math.min(1, intensity)),
+              );
+            } else {
+              target.set(0, 0, 0);
+            }
+          } else {
+            this.pressHeld = false;
+            let intensity =
+              (performance.now() - this.doublePressed) / this.pressMoveAccelMs;
+            intensity = Math.max(0, Math.min(1, intensity));
+            target.multiplyScalar(
+              (this.triplePressed
+                ? this.triplePressMoveSpeed
+                : this.doublePressMoveSpeed) * intensity,
+            );
+          }
+        } else {
+          this.pressHeld = undefined;
+        }
         // Continue to move with inertia
-        this.moveVelocity.multiplyScalar(
-          Math.exp(-deltaTime / this.moveInertia),
-        );
+        const s = Math.exp(-deltaTime / this.moveInertia);
+        this.moveVelocity.lerpVectors(target, this.moveVelocity, s);
         control.position.addScaledVector(this.moveVelocity, deltaTime);
+
+        if (this.moveVelocity.length() * 0.1 > MOVEMENT_THRESHOLD) {
+          updated = true;
+        }
       }
     }
 
@@ -700,6 +897,12 @@ export class PointerControls {
     }
     scroll.applyQuaternion(control.quaternion);
     control.position.add(scroll);
+
+    if (scroll.length() > MOVEMENT_THRESHOLD) {
+      updated = true;
+    }
     this.scroll.set(0, 0, 0);
+
+    return updated;
   }
 }

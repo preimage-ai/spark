@@ -55,8 +55,7 @@ export class RgbaArray {
         count: 0,
       },
       update: (value) => {
-        value.texture =
-          this.readback?.getTexture() ?? this.source ?? RgbaArray.getEmpty();
+        value.texture = this.getTexture();
         value.count = this.count;
         return value;
       },
@@ -65,11 +64,14 @@ export class RgbaArray {
     if (options.array) {
       // Initialize with given array
       this.array = options.array;
-      this.capacity = Math.floor(this.array.length / 4);
-      this.capacity =
-        Math.floor(this.capacity / SPLAT_TEX_WIDTH) * SPLAT_TEX_WIDTH;
+      const splatCount = Math.floor(this.array.length / 4);
+      this.capacity = Math.ceil(splatCount / SPLAT_TEX_WIDTH) * SPLAT_TEX_WIDTH;
+      if (this.capacity > splatCount) {
+        this.array = new Uint8Array(this.capacity * 4);
+        this.array.set(options.array);
+      }
       this.count = Math.min(
-        this.capacity,
+        splatCount,
         options.count ?? Number.POSITIVE_INFINITY,
       );
     } else {
@@ -132,7 +134,7 @@ export class RgbaArray {
       if (!this.source) {
         const { width, height, depth } = getTextureSize(this.capacity);
         this.source = new THREE.DataArrayTexture(
-          this.array,
+          this.array as Uint8Array<ArrayBuffer>,
           width,
           height,
           depth,
@@ -193,6 +195,16 @@ export class RgbaArray {
     }
     const result = await this.readback.readback({ readback: this.array });
     return result.subarray(0, this.count * 4);
+  }
+
+  async getArray(): Promise<Uint8Array> {
+    if (this.readback) {
+      return await this.read();
+    }
+    if (this.array) {
+      return this.array;
+    }
+    throw new Error("No array");
   }
 
   private static emptySource: THREE.DataArrayTexture | null = null;
@@ -272,8 +284,8 @@ export function readRgbaArray(
     globals: () => [defineRgbaArray],
     statements: ({ inputs, outputs }) =>
       unindentLines(`
-        if ((index >= 0) && (index < ${inputs.rgba}.count)) {
-          ${outputs.rgba} = texelFetch(${inputs.rgba}.texture, splatTexCoord(index), 0);
+        if ((${inputs.index} >= 0) && (${inputs.index} < ${inputs.rgba}.count)) {
+          ${outputs.rgba} = texelFetch(${inputs.rgba}.texture, splatTexCoord(${inputs.index}), 0);
         } else {
           ${outputs.rgba} = vec4(0.0, 0.0, 0.0, 0.0);
         }

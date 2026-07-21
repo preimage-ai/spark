@@ -1,13 +1,11 @@
 import { unzipSync } from "fflate";
 import { FileLoader, Loader, type LoadingManager } from "three";
-import {
-  DEFAULT_SPLAT_ENCODING,
-  PackedSplats,
-  type SplatEncoding,
-} from "./PackedSplats";
+import { ExtSplats, type ExtSplatsOptions } from "./ExtSplats";
+import { PackedSplats, type PackedSplatsOptions } from "./PackedSplats";
 import { SplatMesh } from "./SplatMesh";
+import { workerPool } from "./SplatWorker";
+import { type SplatEncoding, SplatFileType } from "./defines";
 import { PlyReader } from "./ply";
-import { withWorker } from "./splatWorker";
 import { decompressPartialGzip, getTextureSize } from "./utils";
 
 // SplatLoader implements the THREE.Loader interface and supports loading a variety
@@ -18,8 +16,6 @@ import { decompressPartialGzip, getTextureSize } from "./utils";
 
 export class SplatLoader extends Loader {
   fileLoader: FileLoader;
-  fileType?: SplatFileType;
-  packedSplats?: PackedSplats;
 
   constructor(manager?: LoadingManager) {
     super(manager);
@@ -28,123 +24,22 @@ export class SplatLoader extends Loader {
 
   load(
     url: string,
-    onLoad?: (decoded: PackedSplats) => void,
+    onLoad?: (decoded: PackedSplats | ExtSplats) => void,
     onProgress?: (event: ProgressEvent) => void,
     onError?: (error: unknown) => void,
   ) {
-    const resolvedURL = this.manager.resolveURL(
-      (this.path ?? "") + (url ?? ""),
-    );
-
-    const headers = new Headers(this.requestHeader);
-    const credentials = this.withCredentials ? "include" : "same-origin";
-    const request = new Request(resolvedURL, { headers, credentials });
-    let fileType = this.fileType;
-
-    this.manager.itemStart(resolvedURL);
-
-    fetchWithProgress(request, onProgress)
-      .then(async (input) => {
-        const progresses = [
-          new ProgressEvent("progress", {
-            lengthComputable: true,
-            loaded: input.byteLength,
-            total: input.byteLength,
-          }),
-        ];
-
-        function updateProgresses() {
-          if (onProgress) {
-            const lengthComputable = progresses.every((p) => {
-              // Either it's computable or no progress yet
-              return p.lengthComputable || (p.loaded === 0 && p.total === 0);
-            });
-            const loaded = progresses.reduce((sum, p) => sum + p.loaded, 0);
-            const total = progresses.reduce((sum, p) => sum + p.total, 0);
-            onProgress(
-              new ProgressEvent("progress", {
-                lengthComputable,
-                loaded,
-                total,
-              }),
-            );
-          }
-        }
-
-        const extraFiles: Record<string, ArrayBuffer> = {};
-        const promises = [];
-
-        const pcSogsJson = tryPcSogs(input);
-        if (fileType === SplatFileType.PCSOGS) {
-          if (pcSogsJson === undefined) {
-            throw new Error("Invalid PC SOGS file");
-          }
-        }
-        if (pcSogsJson !== undefined) {
-          fileType = SplatFileType.PCSOGS;
-          for (const key of ["means", "scales", "quats", "sh0", "shN"]) {
-            const prop = pcSogsJson[key as keyof PcSogsJson];
-            if (prop) {
-              for (const file of prop.files) {
-                const fileUrl = new URL(file, resolvedURL).toString();
-                const progressIndex = progresses.length;
-                progresses.push(new ProgressEvent("progress"));
-
-                this.manager.itemStart(fileUrl);
-                const request = new Request(fileUrl, { headers, credentials });
-                const promise = fetchWithProgress(request, (progress) => {
-                  progresses[progressIndex] = progress;
-                  updateProgresses();
-                })
-                  .then((data) => {
-                    extraFiles[file] = data;
-                  })
-                  .catch((error) => {
-                    this.manager.itemError(fileUrl);
-                    throw error;
-                  })
-                  .finally(() => {
-                    this.manager.itemEnd(fileUrl);
-                  });
-                promises.push(promise);
-              }
-            }
-          }
-        }
-
-        await Promise.all(promises);
-        if (onLoad) {
-          const splatEncoding =
-            this.packedSplats?.splatEncoding ?? DEFAULT_SPLAT_ENCODING;
-          const decoded = await unpackSplats({
-            input,
-            extraFiles,
-            fileType,
-            pathOrUrl: resolvedURL,
-            splatEncoding,
-          });
-
-          if (this.packedSplats) {
-            this.packedSplats.initialize(decoded);
-            onLoad(this.packedSplats);
-          } else {
-            onLoad(new PackedSplats(decoded));
-          }
-        }
-      })
-      .catch((error) => {
-        this.manager.itemError(resolvedURL);
-        onError?.(error);
-      })
-      .finally(() => {
-        this.manager.itemEnd(resolvedURL);
-      });
+    return this.loadInternal({
+      url,
+      onLoad,
+      onProgress,
+      onError,
+    });
   }
 
   async loadAsync(
     url: string,
     onProgress?: (event: ProgressEvent) => void,
-  ): Promise<PackedSplats> {
+  ): Promise<PackedSplats | ExtSplats> {
     return new Promise((resolve, reject) => {
       this.load(
         url,
@@ -159,6 +54,289 @@ export class SplatLoader extends Loader {
 
   parse(packedSplats: PackedSplats): SplatMesh {
     return new SplatMesh({ packedSplats });
+  }
+
+  loadInternal({
+    packedSplats,
+    extSplats,
+    url,
+    fileBytes,
+    fileType,
+    fileName,
+    stream,
+    streamLength,
+    onLoad,
+    onProgress,
+    onError,
+    lod,
+    nonLod,
+    lodAbove,
+    lodBase,
+  }: {
+    packedSplats?: PackedSplats;
+    extSplats?: ExtSplats;
+    url?: string;
+    fileBytes?: Uint8Array | ArrayBuffer;
+    fileType?: SplatFileType;
+    fileName?: string;
+    stream?: ReadableStream;
+    streamLength?: number;
+    onLoad?: (decoded: PackedSplats | ExtSplats) => void;
+    onProgress?: (event: ProgressEvent) => void;
+    onError?: (error: unknown) => void;
+    lod?: boolean | "quality";
+    nonLod?: boolean;
+    lodAbove?: number;
+    lodBase?: number;
+  }) {
+    if (fileBytes instanceof ArrayBuffer) {
+      fileBytes = new Uint8Array(fileBytes);
+    }
+    const resolvedURL = fileBytes
+      ? undefined
+      : this.manager.resolveURL((this.path ?? "") + (url ?? ""));
+
+    let readStream = stream?.getReader();
+
+    this.manager.itemStart(resolvedURL ?? "");
+    // let calledOnLoad = false;
+
+    workerPool
+      .withWorker(async (worker) => {
+        // If LoD is set and not falsey
+        const splatsLod = packedSplats?.lod ?? extSplats?.lod;
+        if (splatsLod) {
+          lod = splatsLod;
+        }
+        const splatsNonLod = packedSplats?.nonLod ?? extSplats?.nonLod;
+        if (splatsNonLod !== undefined) {
+          nonLod = splatsNonLod;
+        }
+
+        // let init: {
+        //   numSplats: number;
+        //   packedArray: Uint32Array;
+        //   extra: Record<string, unknown>;
+        //   splatEncoding: SplatEncoding;
+        // } | null = null;
+        // let initExt: {
+        //   numSplats: number;
+        //   ext0: Uint32Array;
+        //   ext1: Uint32Array;
+        //   extra: Record<string, unknown>;
+        // } | null = null;
+
+        const onStatus = async (data: unknown) => {
+          const { loaded, total } = data as { loaded: number; total: number };
+          if (loaded !== undefined && onProgress) {
+            onProgress(
+              new ProgressEvent("progress", {
+                lengthComputable: total !== 0,
+                loaded,
+                total,
+              }),
+            );
+          }
+
+          if ((data as { nextChunk?: boolean }).nextChunk) {
+            let chunk: Uint8Array;
+            if (!readStream) {
+              chunk = new Uint8Array(0);
+            } else {
+              const { done, value } = await readStream.read();
+              if (done) {
+                readStream.releaseLock();
+                readStream = undefined;
+                chunk = new Uint8Array(0);
+              } else {
+                chunk = value;
+              }
+            }
+            worker.call("nextChunk", { chunk });
+          }
+
+          // if ((data as { orig?: unknown }).orig) {
+          //   if (extSplats) {
+          //     initExt = (data as { orig?: unknown }).orig as {
+          //       numSplats: number;
+          //       ext0: Uint32Array;
+          //       ext1: Uint32Array;
+          //       extra: Record<string, unknown>;
+          //     };
+          //     extSplats.initialize({
+          //       numSplats: initExt?.numSplats,
+          //       extArrays: [initExt?.ext0, initExt?.ext1],
+          //       extra: initExt?.extra,
+          //     });
+          //     calledOnLoad = true;
+          //     onLoad?.(extSplats);
+          //   } else if (packedSplats) {
+          //     init = (data as { orig?: unknown }).orig as {
+          //       numSplats: number;
+          //       packedArray: Uint32Array;
+          //       extra: Record<string, unknown>;
+          //       splatEncoding: SplatEncoding;
+          //     };
+          //     packedSplats.initialize({
+          //       numSplats: init?.numSplats,
+          //       packedArray: init?.packedArray,
+          //       extra: init?.extra,
+          //       splatEncoding: init?.splatEncoding,
+          //     });
+          //     calledOnLoad = true;
+          //     onLoad?.(packedSplats);
+          //   } else {
+          //     console.warn("No splats to initialize");
+          //   }
+          // }
+        };
+
+        const basedUrl = resolvedURL
+          ? new URL(resolvedURL, window.location.href).toString()
+          : undefined;
+        const decoded = (await worker.call(
+          extSplats ? "loadExtSplats" : "loadPackedSplats",
+          {
+            url: basedUrl,
+            requestHeader: this.requestHeader,
+            withCredentials: this.withCredentials,
+            fileBytes: fileBytes?.slice(),
+            fileType,
+            pathName: resolvedURL || fileName,
+            chunked: stream !== undefined,
+            chunkedLength: streamLength,
+            encoding: packedSplats?.splatEncoding,
+            lod,
+            lodBase,
+            nonLod,
+            lodAbove,
+          },
+          { onStatus },
+        )) as {
+          numSplats: number;
+          packedArray?: Uint32Array;
+          ext0?: Uint32Array;
+          ext1?: Uint32Array;
+          extra: Record<string, unknown>;
+          splatEncoding?: SplatEncoding;
+          lodSplats?:
+            | {
+                numSplats: number;
+                packedArray?: Uint32Array;
+                ext0?: Uint32Array;
+                ext1?: Uint32Array;
+                extra: Record<string, unknown>;
+                splatEncoding?: SplatEncoding;
+              }
+            | PackedSplats
+            | ExtSplats;
+        };
+
+        if (decoded.lodSplats) {
+          if (extSplats) {
+            decoded.lodSplats = new ExtSplats({
+              ...(decoded.lodSplats as {
+                numSplats: number;
+                extArrays: [Uint32Array, Uint32Array];
+                extra: Record<string, unknown>;
+              }),
+            });
+          } else {
+            decoded.lodSplats = new PackedSplats({
+              ...(decoded.lodSplats as {
+                numSplats: number;
+                packedArray: Uint32Array;
+                extra: Record<string, unknown>;
+                splatEncoding: SplatEncoding;
+              }),
+              maxSplats: packedSplats?.maxSplats,
+            });
+          }
+        }
+
+        if (extSplats) {
+          const initExtSplats = {
+            // ...(initExt ?? {}),
+            ...decoded,
+          };
+          extSplats.initialize(initExtSplats as ExtSplatsOptions);
+          // if (!calledOnLoad) {
+          onLoad?.(extSplats);
+          // }
+        } else {
+          const initSplats = {
+            // ...(init ?? {}),
+            ...decoded,
+          };
+          if (packedSplats) {
+            packedSplats.initialize(initSplats as PackedSplatsOptions);
+            // if (!calledOnLoad) {
+            onLoad?.(packedSplats);
+            // }
+          } else {
+            // if (!calledOnLoad) {
+            onLoad?.(new PackedSplats(initSplats as PackedSplatsOptions));
+            // }
+          }
+        }
+      })
+      .catch((error) => {
+        this.manager.itemError(resolvedURL ?? "");
+        onError?.(error);
+      })
+      .finally(() => {
+        this.manager.itemEnd(resolvedURL ?? "");
+      });
+  }
+
+  async loadInternalAsync({
+    packedSplats,
+    extSplats,
+    url,
+    fileBytes,
+    fileType,
+    fileName,
+    stream,
+    streamLength,
+    onProgress,
+    lod,
+    nonLod,
+    lodAbove,
+    lodBase,
+  }: {
+    packedSplats?: PackedSplats;
+    extSplats?: ExtSplats;
+    url?: string;
+    fileBytes?: Uint8Array | ArrayBuffer;
+    fileType?: SplatFileType;
+    fileName?: string;
+    stream?: ReadableStream;
+    streamLength?: number;
+    onProgress?: (event: ProgressEvent) => void;
+    lod?: boolean;
+    nonLod?: boolean;
+    lodAbove?: number;
+    lodBase?: number;
+  }) {
+    return new Promise((resolve, reject) => {
+      this.loadInternal({
+        packedSplats,
+        extSplats,
+        url,
+        fileBytes,
+        fileType,
+        fileName,
+        stream,
+        streamLength,
+        onLoad: resolve,
+        onProgress,
+        onError: reject,
+        lod,
+        nonLod,
+        lodAbove,
+        lodBase,
+      });
+    });
   }
 }
 
@@ -177,30 +355,38 @@ async function fetchWithProgress(
   }
 
   const reader = response.body.getReader();
-  const contentLength = Number.parseInt(
-    response.headers.get("Content-Length") || "0",
-  );
-  const total = Number.isNaN(contentLength) ? 0 : contentLength;
   let loaded = 0;
   const chunks: Uint8Array[] = [];
+  try {
+    const contentLength = Number.parseInt(
+      response.headers.get("Content-Length") || "0",
+    );
+    const total = Number.isNaN(contentLength) ? 0 : contentLength;
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
-    }
-    chunks.push(value);
-    loaded += value.length;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      chunks.push(value);
+      loaded += value.length;
 
-    if (onProgress) {
-      onProgress(
-        new ProgressEvent("progress", {
-          lengthComputable: total !== 0,
-          loaded,
-          total,
-        }),
-      );
+      if (onProgress) {
+        onProgress(
+          new ProgressEvent("progress", {
+            lengthComputable: total !== 0,
+            loaded,
+            total,
+          }),
+        );
+      }
     }
+  } catch (err) {
+    try {
+      const reason = err instanceof Error ? err.message : "Unknown error";
+      await reader.cancel(reason);
+    } catch {}
+    throw err;
   }
 
   // Combine chunks into a single buffer
@@ -213,23 +399,15 @@ async function fetchWithProgress(
   return bytes.buffer;
 }
 
-export enum SplatFileType {
-  PLY = "ply",
-  SPZ = "spz",
-  SPLAT = "splat",
-  KSPLAT = "ksplat",
-  PCSOGS = "pcsogs",
-  PCSOGSZIP = "pcsogszip",
-}
-
 export function getSplatFileType(
   fileBytes: Uint8Array,
 ): SplatFileType | undefined {
   const view = new DataView(fileBytes.buffer);
-  if ((view.getUint32(0, true) & 0x00ffffff) === 0x00796c70) {
+  const magic = view.getUint32(0, true);
+  if ((magic & 0x00ffffff) === 0x00796c70) {
     return SplatFileType.PLY;
   }
-  if ((view.getUint32(0, true) & 0x00ffffff) === 0x00088b1f) {
+  if ((magic & 0x00ffffff) === 0x00088b1f) {
     // Gzipped file, unpack beginning to check magic number
     const header = decompressPartialGzip(fileBytes, 4);
     const gView = new DataView(header.buffer);
@@ -239,13 +417,16 @@ export function getSplatFileType(
     // Unknown Gzipped file type
     return undefined;
   }
-  if (view.getUint32(0, true) === 0x04034b50) {
+  if (magic === 0x04034b50) {
     // PKZip file
     if (tryPcSogsZip(fileBytes)) {
       return SplatFileType.PCSOGSZIP;
     }
     // Unknown PKZip file type
     return undefined;
+  }
+  if (magic === 0x30444152) {
+    return SplatFileType.RAD;
   }
   // Unknown file type
   return undefined;
@@ -284,6 +465,9 @@ export function getSplatFileTypeFromPath(
   }
   if (extension === "sog") {
     return SplatFileType.PCSOGSZIP;
+  }
+  if (extension === "rad") {
+    return SplatFileType.RAD;
   }
   return undefined;
 }
@@ -449,129 +633,6 @@ export function tryPcSogsZip(
   }
 }
 
-export async function unpackSplats({
-  input,
-  extraFiles,
-  fileType,
-  pathOrUrl,
-  splatEncoding,
-}: {
-  input: Uint8Array | ArrayBuffer;
-  extraFiles?: Record<string, ArrayBuffer>;
-  fileType?: SplatFileType;
-  pathOrUrl?: string;
-  splatEncoding?: SplatEncoding;
-}): Promise<{
-  packedArray: Uint32Array;
-  numSplats: number;
-  extra?: Record<string, unknown>;
-}> {
-  const fileBytes =
-    input instanceof ArrayBuffer ? new Uint8Array(input) : input;
-  let splatFileType = fileType;
-  if (!fileType) {
-    splatFileType = getSplatFileType(fileBytes);
-    if (!splatFileType && pathOrUrl) {
-      splatFileType = getSplatFileTypeFromPath(pathOrUrl);
-    }
-  }
-
-  switch (splatFileType) {
-    case SplatFileType.PLY: {
-      const ply = new PlyReader({ fileBytes });
-      await ply.parseHeader();
-      const numSplats = ply.numSplats;
-      const maxSplats = getTextureSize(numSplats).maxSplats;
-      const args = {
-        fileBytes,
-        packedArray: new Uint32Array(maxSplats * 4),
-        splatEncoding,
-      };
-      return await withWorker(async (worker) => {
-        const { packedArray, numSplats, extra } = (await worker.call(
-          "unpackPly",
-          args,
-        )) as {
-          packedArray: Uint32Array;
-          numSplats: number;
-          extra: Record<string, unknown>;
-        };
-        return { packedArray, numSplats, extra };
-      });
-    }
-    case SplatFileType.SPZ: {
-      return await withWorker(async (worker) => {
-        const { packedArray, numSplats, extra } = (await worker.call(
-          "decodeSpz",
-          {
-            fileBytes,
-            splatEncoding,
-          },
-        )) as {
-          packedArray: Uint32Array;
-          numSplats: number;
-          extra: Record<string, unknown>;
-        };
-        return { packedArray, numSplats, extra };
-      });
-    }
-    case SplatFileType.SPLAT: {
-      return await withWorker(async (worker) => {
-        const { packedArray, numSplats } = (await worker.call(
-          "decodeAntiSplat",
-          {
-            fileBytes,
-            splatEncoding,
-          },
-        )) as { packedArray: Uint32Array; numSplats: number };
-        return { packedArray, numSplats };
-      });
-    }
-    case SplatFileType.KSPLAT: {
-      return await withWorker(async (worker) => {
-        const { packedArray, numSplats, extra } = (await worker.call(
-          "decodeKsplat",
-          { fileBytes, splatEncoding },
-        )) as {
-          packedArray: Uint32Array;
-          numSplats: number;
-          extra: Record<string, unknown>;
-        };
-        return { packedArray, numSplats, extra };
-      });
-    }
-    case SplatFileType.PCSOGS: {
-      return await withWorker(async (worker) => {
-        const { packedArray, numSplats, extra } = (await worker.call(
-          "decodePcSogs",
-          { fileBytes, extraFiles, splatEncoding },
-        )) as {
-          packedArray: Uint32Array;
-          numSplats: number;
-          extra: Record<string, unknown>;
-        };
-        return { packedArray, numSplats, extra };
-      });
-    }
-    case SplatFileType.PCSOGSZIP: {
-      return await withWorker(async (worker) => {
-        const { packedArray, numSplats, extra } = (await worker.call(
-          "decodePcSogsZip",
-          { fileBytes, splatEncoding },
-        )) as {
-          packedArray: Uint32Array;
-          numSplats: number;
-          extra: Record<string, unknown>;
-        };
-        return { packedArray, numSplats, extra };
-      });
-    }
-    default: {
-      throw new Error(`Unknown splat file type: ${splatFileType}`);
-    }
-  }
-}
-
 export class SplatData {
   numSplats: number;
   maxSplats: number;
@@ -707,18 +768,6 @@ export class SplatData {
       this.sh3[index * 21 + j] = sh3[j];
     }
   }
-}
-
-export async function transcodeSpz(
-  input: TranscodeSpzInput,
-): Promise<{ input: TranscodeSpzInput; fileBytes: Uint8Array }> {
-  return await withWorker(async (worker) => {
-    const result = (await worker.call("transcodeSpz", input)) as {
-      input: TranscodeSpzInput;
-      fileBytes: Uint8Array;
-    };
-    return result;
-  });
 }
 
 export type FileInput = {

@@ -11,12 +11,15 @@
       "dist/*",
       "examples/assets/",
       "examples/showcase/hello-gsplat",
-      "rust/target",
-      "rust/spark-internal-rs/pkg",
-      "src/vrButton.ts",
+      "examples/js",
+      "rust",
       "site",
       "site-repo",
-      "docs"
+      "docs",
+      "*.backup*",
+      "examples/**/spark.module.js",
+      "examples/**/*.json",
+      "examples/**/pkg"
     ]
   },
   "formatter": {

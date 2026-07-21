@@ -26,6 +26,8 @@
     </picture>
   </a>
 
+Built by [World Labs](https://www.worldlabs.ai).
+
 ## Features
 
 - Integrates with THREE.js rendering pipeline to fuse splat and mesh-based objects
@@ -52,20 +54,24 @@ Copy the following code into an `index.html` file.
 <script type="importmap">
   {
     "imports": {
-      "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.178.0/three.module.js",
-      "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/0.1.10/spark.module.js"
+      "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
+      "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/2.1.0/spark.module.js"
     }
   }
 </script>
 <script type="module">
   import * as THREE from "three";
-  import { SplatMesh } from "@sparkjsdev/spark";
+  import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
 
   const scene = new THREE.Scene();
-  const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+  const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 1000);
   const renderer = new THREE.WebGLRenderer();
   renderer.setSize(window.innerWidth, window.innerHeight);
   document.body.appendChild(renderer.domElement)
+
+  const spark = new SparkRenderer({ renderer });
+  scene.add(spark);
 
   const splatURL = "https://sparkjs.dev/assets/splats/butterfly.spz";
   const butterfly = new SplatMesh({ url: splatURL });
@@ -80,18 +86,15 @@ Copy the following code into an `index.html` file.
 </script>
 ```
 
-### Web Editor
-
-Remix the [glitch starter template](https://glitch.com/edit/#!/sparkjs-dev)
-
 ### CDN
 
 ```html
 <script type="importmap">
   {
     "imports": {
-      "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.178.0/three.module.js",
-      "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/0.1.9/spark.module.js"
+      "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
+      "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/2.1.0/spark.module.js"
      }
   }
 </script>
@@ -110,9 +113,10 @@ Install [Rust](https://www.rust-lang.org/tools/install) if it's not already inst
 Next, build Spark by running:
 ```
 npm install
+npm run build:wasm
 npm run build
 ```
-This will first build the Rust Wasm component (can be invoked via `npm run build:wasm`), then Spark itself (`npm run build`).
+This will first build the Rust Wasm component (`npm run build:wasm`), then Spark itself (`npm run build`).
 
 The examples fetch assets from a remote URL. This step is optional, but offline development and faster loading times are possible if you download and cache the assets files locally with the following command:
 ```
@@ -133,6 +137,7 @@ First try cleaning all the build files and re-building everything:
 ```
 npm run clean
 npm install
+npm run build:wasm
 npm run build
 ```
 

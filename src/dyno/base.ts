@@ -185,7 +185,7 @@ export class Dyno<InTypes extends IOTypes, OutTypes extends IOTypes> {
 export type DynoBlockType<InTypes extends IOTypes, OutTypes extends IOTypes> = (
   inputs: { [K in keyof InTypes]?: DynoVal<InTypes[K]> },
   outputs: { [K in keyof OutTypes]?: DynoVal<OutTypes[K]> },
-  { roots }: { roots: Dyno<InTypes, OutTypes>[] },
+  { roots }: { roots: Dyno<IOTypes, IOTypes>[] },
 ) => { [K in keyof OutTypes]?: DynoVal<OutTypes[K]> } | undefined;
 
 export class DynoBlock<
@@ -247,7 +247,7 @@ export class DynoBlock<
       }
     }
 
-    const options = { roots: [] };
+    const options: { roots: Dyno<IOTypes, IOTypes>[] } = { roots: [] };
     const returned = this.construct(blockInputs, blockOutputs, options);
 
     for (const global of this.globals?.({ inputs, outputs, compile }) ?? []) {
@@ -285,6 +285,11 @@ export class DynoBlock<
               break;
             }
             // Must be as HasDynoOut<T>
+            if (typeof input.dynoOut !== "function") {
+              throw new Error(
+                `dynoOut is not a function for ${input.constructor.name}`,
+              );
+            }
             input = input.dynoOut();
           }
         }

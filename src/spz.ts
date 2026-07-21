@@ -1,14 +1,14 @@
 import * as THREE from "three";
 import {
   SplatData,
-  SplatFileType,
   type TranscodeSpzInput,
   getSplatFileType,
   getSplatFileTypeFromPath,
 } from "./SplatLoader";
-import { GunzipReader, fromHalf, normalize, unpackSplat } from "./utils";
+import { GunzipReader, fromHalf, normalize } from "./utils";
 
 import { decodeAntiSplat } from "./antisplat";
+import { SplatFileType } from "./defines";
 import { decodeKsplat } from "./ksplat";
 import { PlyReader } from "./ply";
 
@@ -24,6 +24,7 @@ export class SpzReader {
   fractionalBits = 0;
   flags = 0;
   flagAntiAlias = false;
+  flagLod = false;
   reserved = 0;
   headerParsed = false;
   parsed = false;
@@ -31,7 +32,9 @@ export class SpzReader {
   constructor({ fileBytes }: { fileBytes: Uint8Array | ArrayBuffer }) {
     this.fileBytes =
       fileBytes instanceof ArrayBuffer ? new Uint8Array(fileBytes) : fileBytes;
-    this.reader = new GunzipReader({ fileBytes: this.fileBytes });
+    this.reader = new GunzipReader({
+      fileBytes: this.fileBytes as Uint8Array<ArrayBuffer>,
+    });
   }
 
   async parseHeader() {
@@ -53,6 +56,7 @@ export class SpzReader {
     this.fractionalBits = header.getUint8(13);
     this.flags = header.getUint8(14);
     this.flagAntiAlias = (this.flags & 0x01) !== 0;
+    this.flagLod = (this.flags & 0x80) !== 0;
     this.reserved = header.getUint8(15);
     this.headerParsed = true;
     this.parsed = false;
@@ -81,6 +85,13 @@ export class SpzReader {
       sh2?: Float32Array,
       sh3?: Float32Array,
     ) => void,
+    {
+      childCounts,
+      childStarts,
+    }: {
+      childCounts?: (index: number, count: number) => void;
+      childStarts?: (index: number, start: number) => void;
+    } = {},
   ) {
     if (!this.headerParsed) {
       throw new Error("SPZ file header must be parsed first");
@@ -262,6 +273,25 @@ export class SpzReader {
           offset += 21;
         }
         shCallback?.(i, sh1, sh2, sh3);
+      }
+    }
+    if (this.flagLod) {
+      let bytes = await this.reader.read(this.numSplats * 2);
+      for (let i = 0; i < this.numSplats; i++) {
+        const i2 = i * 2;
+        const count = bytes[i2] + (bytes[i2 + 1] << 8);
+        childCounts?.(i, count);
+      }
+
+      bytes = await this.reader.read(this.numSplats * 4);
+      for (let i = 0; i < this.numSplats; i++) {
+        const i4 = i * 4;
+        const start =
+          bytes[i4] +
+          (bytes[i4 + 1] << 8) +
+          (bytes[i4 + 2] << 16) +
+          (bytes[i4 + 3] << 24);
+        childStarts?.(i, start);
       }
     }
   }
