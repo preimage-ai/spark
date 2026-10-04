@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "emitDeclarationOnly": false,
+    "module": "ESNext",
+    "rootDir": "../..",
+    "types": [
+      "vite/client",
+      "vite-plugin-glsl/ext",
+      "vite-plugin-arraybuffer/types",
+      "node"
+    ]
+  },
+  "include": ["./**/*.ts"]
+}

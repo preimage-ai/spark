@@ -31,6 +31,7 @@ const spark = new SparkRenderer({
 
 | **Parameter**     | Description |
 | ----------------- | ----------- |
+| **onDirty**       | Callback invoked when Spark needs another render to show new results, e.g. a completed sort or LoD update, or a newly streamed chunk. May fire several times per frame, so schedule a single render rather than rendering inside the callback. Use this to drive [on-demand rendering](on-demand-rendering.md). (default: `undefined`)
 | **premultipliedAlpha** | Whether to use premultiplied alpha when accumulating splat RGB. (default: `true`)
 | **timer**         | Pass in a `THREE.Timer` to synchronize time-based effects across different systems. (default: `new THREE.Timer`)
 | **autoUpdate**    | Controls whether to check and automatically update splat collection each frame render. (default: `true`)
@@ -59,6 +60,7 @@ const spark = new SparkRenderer({
 | **pagedExtSplats** | Whether to use extended Gsplat encoding for paged splats, useful for eliminating quantization artifacts from splat scenes with large internal position coordinates. (default: `false`)
 | **maxPagedSplats** | Allocation size of paged splats. This must be a multiple of the page size (65536). (default: `16777216` for desktop, `6291456` for iOS, `8,388,608` for other mobile)
 | **numLodFetchers** | Number of parallel chunk fetchers for LoD. These are run within a shared pool of 4 background WebWorker threads, so setting it above 4 will not have any effect. Setting it 3 leaves one spare worker for other loading/decoding tasks. (default: `3`)
+| **lodCleanupTimeoutMs** | How long (ms) a LoD `SplatMesh` can go unrendered (hidden or removed from the scene) before its LoD state is released: the worker-side tree is dropped and, for paged meshes, its resident pages are freed for other meshes. Rendering it again rebuilds the tree and refetches pages. Set to `Infinity` to never release. (default: `3000`)
 | **coneFov0** | Full-width angle in degrees of fixed foveation cone along the view direction with no foveation applied (full resolution, foveate=1.0). (default: `90.0`)
 | **coneFov** | Full-width angle in degrees of fixed foveation cone along the view direction with reduced resolution specified by `coneFoveate`. Foveation will be applied smoothly from 1.0 down to `coneFoveate` as you move outward from `coneFov0` to `coneFov`. (default: `120.0`)
 | **coneFoveate** | Foveation scale to apply to LoD splats at the edge of coneFov. Foveation will be applied smoothly from `coneFoveate` down to `behindFoveate` as you move outward from `coneFov` to 180 degrees (behind the viewer). (default: `0.4`)

@@ -1,475 +1,16 @@
 import * as THREE from "three";
 
-import { decode_rad_header } from "spark-rs";
-import { LN_SCALE_MAX, LN_SCALE_MIN, dyno } from ".";
 import { evaluateExtSH } from "./ExtSplats";
 import { evaluatePackedSH } from "./PackedSplats";
-import { getSplatFileType, getSplatFileTypeFromPath } from "./SplatLoader";
-import type { SplatSource } from "./SplatMesh";
-import { workerPool } from "./SplatWorker";
-import {
-  DEFAULT_SPLAT_ENCODING,
-  type ExtResult,
-  type PackedResult,
-  type RadMeta,
-  type SplatEncoding,
-  SplatFileType,
-} from "./defines";
+import type { PagedSplats } from "./PagedSplats";
+import type { ExtResult, PackedResult } from "./defines";
+import * as dyno from "./dyno";
 import { type DynoUsampler2DArray, pagedSplatTexCoord } from "./dyno";
-import {
-  decodeExtSplat,
-  getTextureSize,
-  unpackSplat,
-  uploadU32DataTextureRows,
-} from "./utils";
-import * as wasm from "./wasm";
-
-export interface PagedSplatsOptions {
-  pager?: SplatPager;
-  rootUrl?: string;
-  requestHeader?: Record<string, string>;
-  withCredentials?: boolean;
-  fileBytes?: Uint8Array;
-  fileType?: SplatFileType;
-  maxSh?: number;
-}
+import { getTextureSize, removeWhere } from "./utils";
 
 const PAGE_WIDTH = 256;
 const PAGE_HEIGHT = 256;
 const PAGE_SPLATS = PAGE_WIDTH * PAGE_HEIGHT; // 65536
-
-export class PagedSplats implements SplatSource {
-  pager?: SplatPager;
-  rootUrl: string;
-  requestHeader?: Record<string, string>;
-  withCredentials?: boolean;
-  fileBytes?: Uint8Array;
-  fileType?: SplatFileType;
-
-  numSh: number;
-  maxSh: number;
-  sh1Codes?: Uint32Array;
-  sh2Codes?: Uint32Array;
-  sh3Codes?: Uint32Array | [Uint32Array, Uint32Array];
-
-  numSplats: number;
-  splatEncoding?: SplatEncoding;
-  radMetaPromise?: Promise<{ meta: RadMeta; chunksStart: number }>;
-
-  dynoNumSplats: dyno.DynoInt<"numSplats">;
-  dynoIndices: dyno.DynoUsampler2D<"indices", THREE.DataTexture>;
-  rgbMinMaxLnScaleMinMax: dyno.DynoVec4<
-    THREE.Vector4,
-    "rgbMinMaxLnScaleMinMax"
-  >;
-  lodOpacity: dyno.DynoBool<"lodOpacity">;
-  dynoNumSh: dyno.DynoInt<"numSh">;
-  shMax: dyno.DynoVec3<THREE.Vector3, "shMax">;
-
-  constructor(options: PagedSplatsOptions) {
-    this.pager = options.pager;
-    this.rootUrl = options.rootUrl ?? "";
-    this.requestHeader = options.requestHeader;
-    this.withCredentials = options.withCredentials;
-    this.numSh = 0;
-    this.maxSh = options.pager?.maxSh ?? 3;
-
-    this.numSplats = 0;
-
-    this.dynoNumSplats = new dyno.DynoInt({ value: 0 });
-    this.dynoIndices = new dyno.DynoUsampler2D({
-      value: SplatPager.emptyIndicesTexture,
-    });
-
-    this.rgbMinMaxLnScaleMinMax = new dyno.DynoVec4({
-      value: new THREE.Vector4(0.0, 1.0, LN_SCALE_MIN, LN_SCALE_MAX),
-    });
-    this.lodOpacity = new dyno.DynoBool({
-      value: false,
-    });
-
-    this.dynoNumSh = new dyno.DynoInt({ value: 0 });
-    this.shMax = new dyno.DynoVec3({ value: new THREE.Vector3() });
-
-    this.fileBytes = options.fileBytes;
-    this.fileType = options.fileType;
-    if (!this.fileType && this.fileBytes) {
-      this.fileType = getSplatFileType(this.fileBytes);
-    }
-    if (!this.fileType && this.rootUrl) {
-      this.fileType = getSplatFileTypeFromPath(this.rootUrl);
-    }
-    if (!this.fileType) {
-      throw new Error("Unable to determine file type");
-    }
-    if (this.fileType === SplatFileType.RAD) {
-      this.radMetaPromise = this.getRadMeta();
-    }
-  }
-
-  dispose() {
-    if (this.dynoIndices.value !== SplatPager.emptyIndicesTexture) {
-      this.dynoIndices.value.dispose();
-      this.dynoIndices.value = SplatPager.emptyIndicesTexture;
-    }
-  }
-
-  setMaxSh(maxSh: number) {
-    this.maxSh = maxSh;
-  }
-
-  getRadMeta(): Promise<{ meta: RadMeta; chunksStart: number }> {
-    if (this.radMetaPromise) {
-      return this.radMetaPromise;
-    }
-
-    this.radMetaPromise = (async () => {
-      await wasm.initialization;
-
-      if (this.fileBytes) {
-        // Shouldn't be more than 1 MB, so don't send more data than that.
-        const metaStart = decode_rad_header(this.fileBytes.slice(0, 1048576));
-        if (metaStart) {
-          return metaStart;
-        }
-        throw new Error("Failed to decode RAD header");
-      }
-      if (!this.rootUrl) {
-        throw new Error("No url or fileBytes provided");
-      }
-
-      // We don't know how big the header will be. Most likely 64KB will be enough,
-      // but try larger blocks in backoff if it wasn't enough.
-      for (const tryBytes of [65536, 256 * 1024, 1024 * 1024]) {
-        const bytes = await fetchRange({
-          url: this.rootUrl,
-          requestHeader: this.requestHeader,
-          withCredentials: this.withCredentials,
-          offset: 0,
-          bytes: tryBytes,
-        });
-        const metaStart = decode_rad_header(bytes);
-        if (metaStart) {
-          return metaStart;
-        }
-      }
-      throw new Error("Failed to decode RAD header");
-    })().then((metaStart) => {
-      // console.log("RAD meta: ", metaStart.meta);
-      return metaStart;
-    });
-
-    this.radMetaPromise.catch((error) => {
-      console.error(error);
-      // Allow it to be tried again
-      // this.radMetaPromise = undefined;
-    });
-
-    return this.radMetaPromise;
-  }
-
-  chunkUrl(chunk: number): string {
-    return this.rootUrl.replace(/-lod-0\./, `-lod-${chunk}.`);
-  }
-
-  async fetchDecodeChunk(chunk: number) {
-    let decodeBytes = undefined;
-
-    if (this.fileType === SplatFileType.RAD) {
-      const { meta, chunksStart } = await this.getRadMeta();
-      if (chunk < 0 || chunk >= meta.chunks.length) {
-        throw new Error(
-          `Chunk index out of range: ${chunk} (max: ${meta.chunks.length - 1})`,
-        );
-      }
-      let { offset, bytes, filename } = meta.chunks[chunk];
-
-      if (filename) {
-        if (this.fileBytes) {
-          throw new Error("Chunked RAD file not supported with fileBytes");
-        }
-        const resolvedRoot = new URL(
-          this.rootUrl,
-          window.location.href,
-        ).toString();
-        const chunkUrl = new URL(filename, resolvedRoot).toString();
-        decodeBytes = await fetchRange({
-          url: chunkUrl,
-          requestHeader: this.requestHeader,
-          withCredentials: this.withCredentials,
-        });
-      } else {
-        offset += chunksStart;
-        // console.log(`Fetching chunk ${chunk} at offset ${offset} with bytes ${bytes}`);
-        if (this.fileBytes) {
-          if (offset < 0 || offset + bytes > this.fileBytes.length) {
-            throw new Error(
-              `Invalid chunk offset or bytes: ${offset} + ${bytes} > ${this.fileBytes.length}`,
-            );
-          }
-          decodeBytes = this.fileBytes.slice(offset, offset + bytes);
-        } else if (this.rootUrl) {
-          decodeBytes = await fetchRange({
-            url: this.rootUrl,
-            requestHeader: this.requestHeader,
-            withCredentials: this.withCredentials,
-            offset,
-            bytes,
-          });
-        } else {
-          throw new Error("No url or fileBytes provided");
-        }
-      }
-    } else if (this.fileBytes) {
-      // Fall through
-    } else if (this.rootUrl) {
-      const url = this.chunkUrl(chunk);
-      const request = new Request(url, {
-        headers: this.requestHeader
-          ? new Headers(this.requestHeader)
-          : undefined,
-        credentials: this.withCredentials ? "include" : "same-origin",
-      });
-      const response = await fetch(request);
-      if (!response.ok || !response.body) {
-        throw new Error(
-          `Failed to fetch "${url}": ${response.status} ${response.statusText}`,
-        );
-      }
-      decodeBytes = new Uint8Array(await response.arrayBuffer());
-    } else {
-      throw new Error("No url or fileBytes provided");
-    }
-
-    return await workerPool.withWorker(async (worker) => {
-      if (!this.pager) {
-        throw new Error("PagedSplats.pager not set");
-      }
-      if (!this.pager.extSplats) {
-        const result = (await worker.call("loadPackedSplats", {
-          fileBytes: decodeBytes,
-          pathName: this.chunkUrl(chunk),
-          sh1Codes: this.sh1Codes?.slice(),
-          sh2Codes: this.sh2Codes?.slice(),
-          sh3Codes: this.sh3Codes?.slice(),
-        })) as { lodSplats: PackedResult };
-        const lodSplats = result.lodSplats;
-        if (!this.splatEncoding) {
-          this.splatEncoding = lodSplats.splatEncoding;
-
-          this.numSh = lodSplats.extra.sh3
-            ? 3
-            : lodSplats.extra.sh2
-              ? 2
-              : lodSplats.extra.sh1
-                ? 1
-                : 0;
-
-          this.rgbMinMaxLnScaleMinMax.value.set(
-            this.splatEncoding.rgbMin ?? 0.0,
-            this.splatEncoding.rgbMax ?? 1.0,
-            this.splatEncoding.lnScaleMin ?? LN_SCALE_MIN,
-            this.splatEncoding.lnScaleMax ?? LN_SCALE_MAX,
-          );
-
-          this.lodOpacity.value = this.splatEncoding.lodOpacity ?? false;
-
-          this.shMax.value.set(
-            this.splatEncoding.sh1Max ?? 1.0,
-            this.splatEncoding.sh2Max ?? 1.0,
-            this.splatEncoding.sh3Max ?? 1.0,
-          );
-        }
-        this.sh1Codes = lodSplats.extra.sh1Codes ?? this.sh1Codes;
-        this.sh2Codes = lodSplats.extra.sh2Codes ?? this.sh2Codes;
-        this.sh3Codes = lodSplats.extra.sh3Codes ?? this.sh3Codes;
-        return lodSplats;
-      }
-
-      const sh3Codes = this.sh3Codes as [Uint32Array, Uint32Array] | undefined;
-      const result = (await worker.call("loadExtSplats", {
-        fileBytes: decodeBytes,
-        pathName: this.chunkUrl(chunk),
-        sh1Codes: this.sh1Codes?.slice(),
-        sh2Codes: this.sh2Codes?.slice(),
-        sh3Codes: sh3Codes
-          ? [sh3Codes[0].slice(), sh3Codes[1].slice()]
-          : undefined,
-      })) as { lodSplats: ExtResult };
-      const lodSplats = result.lodSplats;
-      if (!this.splatEncoding) {
-        this.splatEncoding = DEFAULT_SPLAT_ENCODING;
-        this.numSh =
-          lodSplats.extra.sh3a && lodSplats.extra.sh3b
-            ? 3
-            : lodSplats.extra.sh2
-              ? 2
-              : lodSplats.extra.sh1
-                ? 1
-                : 0;
-      }
-      this.sh1Codes = lodSplats.extra.sh1Codes ?? this.sh1Codes;
-      this.sh2Codes = lodSplats.extra.sh2Codes ?? this.sh2Codes;
-      this.sh3Codes = lodSplats.extra.sh3Codes ?? this.sh3Codes;
-      return lodSplats;
-    });
-  }
-
-  update(numSplats: number, indices: Uint32Array) {
-    if (!this.pager) {
-      throw new Error("PagedSplats.pager not set");
-    }
-
-    const renderer = this.pager.renderer;
-    this.numSplats = numSplats;
-    this.dynoNumSplats.value = this.numSplats;
-    const rows = Math.ceil(numSplats / 16384);
-
-    let indicesTexture =
-      this.dynoIndices.value === SplatPager.emptyIndicesTexture
-        ? undefined
-        : this.dynoIndices.value;
-    if (indicesTexture && rows > indicesTexture.image.height) {
-      indicesTexture.dispose();
-      indicesTexture = undefined;
-    }
-
-    if (!indicesTexture) {
-      indicesTexture = new THREE.DataTexture(
-        indices,
-        4096,
-        rows,
-        THREE.RGBAIntegerFormat,
-        THREE.UnsignedIntType,
-      );
-      indicesTexture.internalFormat = "RGBA32UI";
-      indicesTexture.needsUpdate = true;
-      renderer.initTexture(indicesTexture);
-      this.dynoIndices.value = indicesTexture;
-    } else {
-      const textureIndices = indicesTexture.image.data as Uint32Array;
-      textureIndices.set(indices.subarray(0, numSplats));
-
-      uploadU32DataTextureRows(
-        renderer,
-        indicesTexture,
-        4096,
-        rows,
-        textureIndices,
-      );
-    }
-  }
-
-  prepareFetchSplat() {}
-
-  getNumSplats(): number {
-    return this.numSplats;
-  }
-
-  hasRgbDir(): boolean {
-    if (!this.pager) {
-      return false;
-    }
-    return Math.min(this.numSh, this.pager.maxSh) > 0;
-  }
-
-  getNumSh(): number {
-    return this.numSh;
-  }
-
-  fetchSplat({
-    index,
-    viewOrigin,
-  }: {
-    index: dyno.DynoVal<"int">;
-    viewOrigin?: dyno.DynoVal<"vec3">;
-  }): dyno.DynoVal<typeof dyno.Gsplat> {
-    if (!this.pager) {
-      throw new Error("PagedSplats.pager not set");
-    }
-
-    const splatIndex = this.pager.readIndex.apply({
-      index,
-      numSplats: this.dynoNumSplats,
-      indices: this.dynoIndices,
-    }).index;
-
-    if (!this.pager.extSplats) {
-      if (this.hasRgbDir() && viewOrigin) {
-        this.dynoNumSh.value = Math.min(
-          this.numSh,
-          this.maxSh,
-          this.pager.maxSh,
-        );
-        return this.pager.readSplatDir.apply({
-          index: splatIndex,
-          rgbMinMaxLnScaleMinMax: this.rgbMinMaxLnScaleMinMax,
-          lodOpacity: this.lodOpacity,
-          viewOrigin,
-          numSh: this.dynoNumSh,
-          shMax: this.shMax,
-        }).gsplat;
-      }
-      return this.pager.readSplat.apply({
-        index: splatIndex,
-        rgbMinMaxLnScaleMinMax: this.rgbMinMaxLnScaleMinMax,
-        lodOpacity: this.lodOpacity,
-      }).gsplat;
-    }
-
-    if (this.hasRgbDir() && viewOrigin) {
-      this.dynoNumSh.value = Math.min(this.numSh, this.maxSh, this.pager.maxSh);
-      return this.pager.readSplatExtDir.apply({
-        index: splatIndex,
-        viewOrigin,
-        numSh: this.dynoNumSh,
-      }).gsplat;
-    }
-    return this.pager.readSplatExt.apply({ index: splatIndex }).gsplat;
-  }
-
-  // Iterate over Gsplats index 0..=(this.numSplats-1), unpack each Gsplat
-  // and invoke the callback function with the Gsplat attributes.
-  forEachSplat(
-    callback: (
-      index: number,
-      center: THREE.Vector3,
-      scales: THREE.Vector3,
-      quaternion: THREE.Quaternion,
-      opacity: number,
-      color: THREE.Color,
-    ) => void,
-  ) {
-    if (!this.pager || !this.numSplats) {
-      return;
-    }
-    const extSplats = this.pager.extSplats;
-    const indices = this.dynoIndices.value.image.data as Uint32Array;
-    const packedSplatArray = this.pager.packedTexture.value.image
-      .data as Uint32Array;
-    const extPackedSplatArray = this.pager.extTexture.value.image
-      .data as Uint32Array;
-    const extArrays: [Uint32Array, Uint32Array] = [
-      packedSplatArray,
-      extPackedSplatArray,
-    ];
-
-    for (let i = 0; i < this.numSplats; ++i) {
-      const splatIndex = indices[i];
-      const unpacked = extSplats
-        ? decodeExtSplat(extArrays, splatIndex)
-        : unpackSplat(packedSplatArray, splatIndex, this.splatEncoding);
-      callback(
-        i,
-        unpacked.center,
-        unpacked.scales,
-        unpacked.quaternion,
-        unpacked.opacity,
-        unpacked.color,
-      );
-    }
-  }
-}
 
 export interface SplatPagerOptions {
   /**
@@ -501,6 +42,11 @@ export interface SplatPagerOptions {
    * @default 3
    */
   numFetchers?: number;
+  /**
+   * Called after each chunk fetch attempt settles (success or failure);
+   * a render is needed to page in the chunk or retry.
+   */
+  onUpdate: () => void;
 }
 
 interface PageUpload {
@@ -524,6 +70,7 @@ export class SplatPager {
 
   autoDrive: boolean;
   numFetchers: number;
+  onUpdate?: () => void;
   fetchPause = 0;
 
   splatsChunkToPage: Map<
@@ -534,11 +81,11 @@ export class SplatPager {
     | { splats: PagedSplats; chunk: number; time: number }
     | undefined
   )[] = [];
-  pageFreelist: number[];
-  pageLru: Set<{ page: number; lru: number }>;
-  freeablePages: number[];
-  newUploads: PageUpload[];
-  readyUploads: PageUpload[];
+  private readonly pageFreelist: number[];
+  private readonly pageLru: Set<{ page: number; lru: number }>;
+  private freeablePages: number[];
+  private newUploads: PageUpload[];
+  private readonly readyUploads: PageUpload[];
   lodTreeUpdates: {
     splats: PagedSplats;
     page: number;
@@ -547,8 +94,8 @@ export class SplatPager {
     lodTree?: Uint32Array;
   }[];
 
-  fetchers: { splats: PagedSplats; chunk: number; promise: Promise<void> }[];
-  fetched: {
+  private readonly fetchers: { splats: PagedSplats; chunk: number }[];
+  private readonly fetched: {
     splats: PagedSplats;
     chunk: number;
     data: PackedResult | ExtResult;
@@ -609,6 +156,7 @@ export class SplatPager {
 
     this.autoDrive = options.autoDrive ?? true;
     this.numFetchers = options.numFetchers ?? 3;
+    this.onUpdate = options.onUpdate;
 
     this.splatsChunkToPage = new Map();
     this.pageToSplatsChunk = new Array(this.maxPages);
@@ -659,7 +207,7 @@ export class SplatPager {
             indices,
           },
           statements: ({ inputs, outputs }) =>
-            dyno.unindentLines(`
+            dyno.unindentLines(/* glsl */ `
             if (${inputs.index} >= ${inputs.numSplats}) {
               return;
             }
@@ -692,7 +240,7 @@ export class SplatPager {
           },
           globals: () => [dyno.defineGsplat],
           statements: ({ inputs, outputs }) =>
-            dyno.unindentLines(`
+            dyno.unindentLines(/* glsl */ `
             int index = ${inputs.index};
             ivec3 splatCoord = pagedSplatTexCoord(index);
             uvec4 packedData = texelFetch(${inputs.packedTexture}, splatCoord, 0);
@@ -781,7 +329,7 @@ export class SplatPager {
           },
           globals: () => [dyno.defineGsplat],
           statements: ({ inputs, outputs }) =>
-            dyno.unindentLines(`
+            dyno.unindentLines(/* glsl */ `
             int index = ${inputs.index};
             ivec3 splatCoord = ivec3(index & 255, (index >> 8) & 255, index >> 16);
             uvec4 ext1 = texelFetch(${inputs.extTexture1}, splatCoord, 0);
@@ -837,6 +385,7 @@ export class SplatPager {
   dispose() {
     this.autoDrive = false;
     this.numFetchers = 0;
+    this.onUpdate = undefined;
 
     this.packedTexture.value.dispose();
     this.packedTexture.value.source.data = null;
@@ -857,13 +406,11 @@ export class SplatPager {
     }
   }
 
-  private ensureShTextures(numSh: number) {
-    this.curSh = Math.max(this.curSh, numSh);
-
+  private ensureShTextures(numTextures: number) {
     const emptyShTextures = this.extSplats
       ? SplatPager.emptyExtShTextures
       : SplatPager.emptyShTextures;
-    for (let i = 0; i < this.curSh; i++) {
+    for (let i = 0; i < numTextures; i++) {
       if (this.shTextures[i].value === emptyShTextures[i]) {
         const elementsPerSplat =
           this.shTextures[i].value === SplatPager.emptyUint32x2 ? 2 : 4;
@@ -945,27 +492,43 @@ export class SplatPager {
   }
 
   removeSplats(splats: PagedSplats) {
-    const chunks = this.splatsChunkToPage.get(splats);
-    if (!chunks) {
-      return;
-    }
-
     const freedPages = new Set<number>();
 
-    while (chunks.length > 0) {
-      const chunk = chunks.pop();
-      if (chunk) {
-        const { page } = chunk;
-        this.pageToSplatsChunk[page] = undefined;
-        freedPages.add(page);
-        this.pageFreelist.push(page);
-        this.pageLru.delete(chunk);
+    const chunks = this.splatsChunkToPage.get(splats);
+    if (chunks) {
+      while (chunks.length > 0) {
+        const chunk = chunks.pop();
+        if (chunk) {
+          const { page } = chunk;
+          this.pageToSplatsChunk[page] = undefined;
+          freedPages.add(page);
+          this.pageFreelist.push(page);
+          this.pageLru.delete(chunk);
+        }
       }
+      this.splatsChunkToPage.delete(splats);
+      this.freeablePages = this.freeablePages.filter(
+        (page) => !freedPages.has(page),
+      );
     }
-    this.splatsChunkToPage.delete(splats);
-    this.freeablePages = this.freeablePages.filter(
-      (page) => !freedPages.has(page),
-    );
+
+    // Nothing queued may still refer to these splats or their freed pages:
+    // a chunk that landed after the last consume would otherwise be inserted
+    // into a future tree for the same splats, pointing at a page we no
+    // longer own. This must run even when no pages are mapped yet: the root
+    // chunk may be sitting in `fetched`, and processFetched would map it for
+    // splats that no longer have a tree.
+    removeWhere(this.fetched, (f) => f.splats === splats);
+    removeWhere(this.lodTreeUpdates, (u) => u.splats === splats);
+    removeWhere(this.newUploads, (u) => freedPages.has(u.page));
+    removeWhere(this.readyUploads, (u) => freedPages.has(u.page));
+    // Fetches still in flight drop their chunk when they find themselves no
+    // longer in `fetchers`. `fetchPriority` is stale until the next traverse,
+    // so autoDrive must not start new fetches from it either.
+    removeWhere(this.fetchers, (f) => f.splats === splats);
+    removeWhere(this.fetchPriority, (p) => p.splats === splats);
+    // Stop drawing indices into pages that no longer hold these splats.
+    splats.clear();
   }
 
   private uploadPage(
@@ -982,9 +545,9 @@ export class SplatPager {
       uploadTextureLayer(this.extTexture, page, pageBase * 4, extArray);
     }
 
-    // In case of extSplats there can be 4 shArrays for 3 sh degrees
-    const numSh = Math.min(shArrays.length, 3);
-    this.ensureShTextures(numSh);
+    // With extSplats SH3 spans two textures: four arrays, three degrees.
+    this.curSh = Math.max(this.curSh, Math.min(shArrays.length, 3));
+    this.ensureShTextures(shArrays.length);
 
     for (let i = 0; i < shArrays.length; i++) {
       const array = shArrays[i];
@@ -1053,10 +616,24 @@ export class SplatPager {
 
       if (numPages < this.maxPages && this.fetchers.length < this.numFetchers) {
         numPages += 1;
+
+        // Add self to active fetchers list
+        const fetcher = { splats, chunk };
+        this.fetchers.push(fetcher);
+
         const promise = splats
           .fetchDecodeChunk(chunk)
           .then(
             async (data) => {
+              // Drop the chunk if the originating PagedSplats was disposed, or
+              // removed from the pager, while the fetch was in flight.
+              if (
+                splats.abortController.signal.aborted ||
+                !this.fetchers.includes(fetcher)
+              ) {
+                return;
+              }
+
               // Place data in ready queue and remove self from active fetchers list
               this.fetched.push({ splats, chunk, data });
               if (this.fetchPause > 0) {
@@ -1066,19 +643,29 @@ export class SplatPager {
               }
             },
             async (error) => {
-              console.warn(error);
+              // An AbortError can be expected in case the originating PagedSplat has been disposed.
+              if (error.name !== "AbortError") {
+                console.warn(error);
+              }
+              // NOTE: backoff is needed as the fetchPriority needs to change before
+              //       reattempting makes sense. The SparkRenderer is responsible for this.
               const backoff = 250 + 500 * Math.random();
               await new Promise((resolve) => setTimeout(resolve, backoff));
             },
           )
           .finally(() => {
-            this.fetchers = this.fetchers.filter(
-              ({ splats: s, chunk: c }) => splats !== s || chunk !== c,
-            );
+            // Remove this fetcher from active fetchers list, unless
+            // removeSplats already did
+            const fetchIndex = this.fetchers.indexOf(fetcher);
+            if (fetchIndex >= 0) {
+              this.fetchers[fetchIndex] =
+                this.fetchers[this.fetchers.length - 1];
+              this.fetchers.length--;
+            }
+
             this.processFetched();
+            this.onUpdate?.();
           });
-        // Add self to active fetchers list
-        this.fetchers.push({ splats, chunk, promise });
 
         promise.then((data) => {
           if (this.autoDrive) {
@@ -1170,7 +757,10 @@ export class SplatPager {
           data.extra.sh3a as Uint32Array,
           data.extra.sh3b as Uint32Array,
         ];
-        shArrays.length = shArrays.findIndex((sh) => !sh);
+        // findIndex returns -1 when all SH arrays are present — keep the full list
+        // (Array.length = -1 throws a RangeError)
+        const firstMissingSh = shArrays.findIndex((sh) => !sh);
+        if (firstMissingSh >= 0) shArrays.length = firstMissingSh;
         this.newUploads.push({
           page,
           numSplats,
@@ -1185,7 +775,10 @@ export class SplatPager {
           data.extra.sh2 as Uint32Array,
           data.extra.sh3 as Uint32Array,
         ];
-        shArrays.length = shArrays.findIndex((sh) => !sh);
+        // findIndex returns -1 when all SH arrays are present — keep the full list
+        // (Array.length = -1 throws a RangeError)
+        const firstMissingSh = shArrays.findIndex((sh) => !sh);
+        if (firstMissingSh >= 0) shArrays.length = firstMissingSh;
         this.newUploads.push({
           page,
           numSplats,
@@ -1205,6 +798,29 @@ export class SplatPager {
       const { page, numSplats, packedArray, extArray, shArrays } = upload;
       this.uploadPage(page, packedArray, shArrays, extArray);
     }
+  }
+
+  /** True while chunk requests are in flight. */
+  isFetching() {
+    return this.fetchers.length > 0;
+  }
+
+  /**
+   * True while fetched chunks, uploads, or tree updates wait for Spark to
+   * consume them. Uploads already handed to Spark (flushed by its next LoD
+   * traverse via processUploads) are not counted.
+   */
+  hasQueued() {
+    return (
+      this.fetched.length > 0 ||
+      this.newUploads.length > 0 ||
+      this.lodTreeUpdates.length > 0
+    );
+  }
+
+  /** True while chunks are being fetched or are waiting to be paged in. */
+  isPending() {
+    return this.isFetching() || this.hasQueued();
   }
 
   consumeLodTreeUpdates() {
@@ -1248,16 +864,6 @@ export class SplatPager {
     return texture;
   })();
 
-  static emptyIndicesTexture = (() => {
-    const emptyArray = new Uint32Array(4096 * 4);
-    const texture = new THREE.DataTexture(emptyArray, 4096, 1);
-    texture.format = THREE.RGBAIntegerFormat;
-    texture.type = THREE.UnsignedIntType;
-    texture.internalFormat = "RGBA32UI";
-    texture.needsUpdate = true;
-    return texture;
-  })();
-
   static emptyPackedTexture = this.emptyUint32x4;
   static emptyExtTexture = this.emptyUint32x4;
   static emptyShTextures = [
@@ -1293,33 +899,4 @@ function uploadTextureLayer(
   texture.value.addLayerUpdate(layer);
   texture.value.needsUpdate = true;
   texture.value.source.dataReady = true;
-}
-
-async function fetchRange({
-  url,
-  requestHeader,
-  withCredentials,
-  offset,
-  bytes,
-}: {
-  url: string;
-  requestHeader?: Record<string, string>;
-  withCredentials?: boolean;
-  offset?: number;
-  bytes?: number;
-}): Promise<Uint8Array> {
-  const request = new Request(url, {
-    headers: requestHeader ? new Headers(requestHeader) : undefined,
-    credentials: withCredentials ? "include" : "same-origin",
-  });
-  if (offset !== undefined && bytes !== undefined) {
-    request.headers.set("Range", `bytes=${offset}-${offset + bytes - 1}`);
-  }
-  const response = await fetch(request);
-  if (!response.ok || !response.body) {
-    throw new Error(
-      `Failed to fetch "${url}": ${response.status} ${response.statusText}`,
-    );
-  }
-  return new Uint8Array(await response.arrayBuffer());
 }

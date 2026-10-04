@@ -10,7 +10,6 @@ import {
   unindent,
   unindentLines,
 } from "./dyno";
-import { newArray } from "./utils";
 
 // Spark provides the ability to apply "edits" to Gsplats as part of the standard
 // SplatMesh pipeline. These edits take the form of a sequence of operations,
@@ -127,6 +126,8 @@ export type SplatEditSdfOptions = {
 };
 
 export class SplatEditSdf extends THREE.Object3D {
+  readonly isSplatEditSdf = true;
+
   type: SplatEditSdfType;
   invert: boolean;
   opacity: number;
@@ -144,6 +145,10 @@ export class SplatEditSdf extends THREE.Object3D {
     this.displace = displace ?? new THREE.Vector3(0.0, 0.0, 0.0);
     this.radius = radius ?? 0.0;
   }
+}
+
+export function isSplatEditSdf(obj: THREE.Object3D): obj is SplatEditSdf {
+  return (obj as SplatEditSdf).isSplatEditSdf;
 }
 
 export type SplatEditOptions = {
@@ -167,6 +172,8 @@ export type SplatEditOptions = {
 };
 
 export class SplatEdit extends THREE.Object3D {
+  readonly isSplatEdit = true;
+
   // ordering used to apply SplatEdit operations to Gsplats. This is implicitly
   // increased with each new SplatEdit. Reassigning ordering can be used to
   // reorder the operations.
@@ -220,6 +227,10 @@ export class SplatEdit extends THREE.Object3D {
     }
     this.sdfs = this.sdfs.filter((s) => s !== sdf);
   }
+}
+
+export function isSplatEdit(obj: THREE.Object3D): obj is SplatEdit {
+  return (obj as SplatEdit).isSplatEdit;
 }
 
 // Dyno implementation of RGBA-XYZ SDF editing.
@@ -566,7 +577,7 @@ export class SplatEdits {
 
 export const SdfArray = { type: "SdfArray" } as { type: "SdfArray" };
 
-export const defineSdfArray = unindent(`
+export const defineSdfArray = unindent(/* glsl */ `
   struct SdfArray {
     int numSdfs;
     usampler2D sdfTexture;
@@ -733,7 +744,7 @@ export const defineSdfArray = unindent(`
   }
 `);
 
-export const defineEdit = unindent(`
+export const defineEdit = unindent(/* glsl */ `
   const uint EDIT_FLAG_BLEND = 0xFFu;
   const uint EDIT_BLEND_MULTIPLY = 0u;
   const uint EDIT_BLEND_SET_RGB = 1u;
@@ -820,7 +831,7 @@ function applyGsplatRgbaDisplaceEdits(
     statements: ({ inputs, outputs }) => {
       const { sdfArray, numEdits, rgbaDisplaceEdits } = inputs;
       const { gsplat } = outputs;
-      return unindentLines(`
+      return unindentLines(/* glsl */ `
         ${gsplat} = ${inputs.gsplat};
         if (isGsplatActive(${gsplat}.flags)) {
           for (int editIndex = 0; editIndex < ${numEdits}; ++editIndex) {
@@ -863,7 +874,7 @@ function applyCovSplatRgbaDisplaceEdits(
     statements: ({ inputs, outputs }) => {
       const { sdfArray, numEdits, rgbaDisplaceEdits } = inputs;
       const { covsplat } = outputs;
-      return unindentLines(`
+      return unindentLines(/* glsl */ `
         ${covsplat} = ${inputs.covsplat};
         if (isCovSplatActive(${covsplat}.flags)) {
           for (int editIndex = 0; editIndex < ${numEdits}; ++editIndex) {

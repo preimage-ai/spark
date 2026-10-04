@@ -1,22 +1,36 @@
 
 pub mod tsplat;
+#[cfg(feature = "gsplat")]
 pub mod gsplat;
+#[cfg(feature = "csplat")]
 pub mod csplat;
 pub mod symmat3;
+#[cfg(feature = "quick_lod")]
 pub mod quick_lod;
+#[cfg(feature = "tiny_lod")]
 pub mod tiny_lod;
+#[cfg(feature = "bhatt_lod")]
 pub mod bhatt_lod;
+#[cfg(feature = "ply")]
 pub mod ply;
+#[cfg(feature = "spz")]
 pub mod spz;
+#[cfg(feature = "antisplat")]
 pub mod antisplat;
+#[cfg(feature = "ksplat")]
 pub mod ksplat;
+#[cfg(feature = "sogs")]
 pub mod sogs;
+#[cfg(feature = "rad")]
 pub mod rad;
 pub mod decoder;
 pub mod splat_encode;
 pub mod ordering;
 pub mod chunk_tree;
 pub mod sh_clustering;
+
+#[cfg(not(any(feature = "gsplat", feature = "csplat")))]
+compile_error!("at least one of \"gsplat\" and \"csplat\" must be enabled");
 
 #[cfg(test)]
 mod tests {
@@ -27,6 +41,7 @@ mod tests {
         spz::{SpzDecoder, SpzEncoder},
     };
     use super::decoder::ChunkReceiver;
+    use super::splat_encode::{decode_ext_rgb, encode_ext_rgb};
     use glam::{Quat, Vec3A};
     use crate::tsplat::TsplatArray;
 
@@ -158,6 +173,140 @@ mod tests {
         for i in 0..9 { assert!(approx(got1[i], sh1_vals[i], 0.15), "sh1[{}] {} vs {}", i, got1[i], sh1_vals[i]); }
         let got2 = out.sh2[0].to_array();
         for i in 0..15 { assert!(approx(got2[i], sh2_vals[i], 0.20), "sh2[{}] {} vs {}", i, got2[i], sh2_vals[i]); }
+    }
+
+    // Undoes the gzip framing SpzEncoder puts around the payload
+    fn spz_payload(encoded: &[u8]) -> Vec<u8> {
+        miniz_oxide::inflate::decompress_to_vec(&encoded[10..encoded.len() - 8]).expect("inflate ok")
+    }
+
+    fn spz_version(payload: &[u8]) -> u32 {
+        u32::from_le_bytes(payload[4..8].try_into().unwrap())
+    }
+
+    #[test]
+    fn spz_roundtrip_version2_quaternion() {
+        let mut arr = GsplatArray::new_capacity(1, 0);
+        let quat = [0.1, 0.2, 0.3, 0.9273618];
+        arr.push_splat(make_splat([0.1, 0.2, 0.3], 0.7, [0.2, 0.5, 0.8], [0.5, 0.6, 0.7], quat), None, None, None);
+
+        let encoded = SpzEncoder::new(arr).with_version(2).with_fractional_bits(12).encode().expect("encode ok");
+        assert_eq!(spz_version(&spz_payload(&encoded)), 2);
+
+        let mut dec = SpzDecoder::new(GsplatArray::new());
+        dec.push(&encoded).expect("push ok");
+        dec.finish().expect("finish ok");
+        let out = dec.into_splats();
+
+        assert_eq!(out.len(), 1);
+        let got = out.splats[0].quaternion.map(|v| v.to_f32());
+        for i in 0..4 { assert!(approx(got[i], quat[i], 0.02), "quat[{}] {} vs {}", i, got[i], quat[i]); }
+    }
+
+    #[test]
+    fn spz_roundtrip_default_version_quaternion() {
+        // One case per largest component, which selects the packing. The largest
+        // decodes positive, so a negative one returns the negated rotation.
+        let cases = [
+            ([0.9273618, 0.1, 0.2, 0.3], [0.9273618, 0.1, 0.2, 0.3]),
+            ([0.1, 0.9273618, 0.2, 0.3], [0.1, 0.9273618, 0.2, 0.3]),
+            ([0.1, 0.2, 0.9273618, 0.3], [0.1, 0.2, 0.9273618, 0.3]),
+            ([0.1, 0.2, 0.3, 0.9273618], [0.1, 0.2, 0.3, 0.9273618]),
+            ([0.1, 0.2, 0.3, -0.9273618], [-0.1, -0.2, -0.3, 0.9273618]),
+            // Not unit length, so it has to be normalised before packing
+            ([0.2, 0.4, 0.6, 1.8547236], [0.1, 0.2, 0.3, 0.9273618]),
+        ];
+        let mut arr = GsplatArray::new_capacity(cases.len(), 0);
+        for (quat, _) in cases {
+            arr.push_splat(make_splat([0.1, 0.2, 0.3], 0.7, [0.2, 0.5, 0.8], [0.5, 0.6, 0.7], quat), None, None, None);
+        }
+
+        let encoded = SpzEncoder::new(arr).with_fractional_bits(12).encode().expect("encode ok");
+        assert_eq!(spz_version(&spz_payload(&encoded)), 3);
+
+        let mut dec = SpzDecoder::new(GsplatArray::new());
+        dec.push(&encoded).expect("push ok");
+        dec.finish().expect("finish ok");
+        let out = dec.into_splats();
+
+        assert_eq!(out.len(), cases.len());
+        for (s, (_, want)) in cases.iter().enumerate() {
+            let got = out.splats[s].quaternion.map(|v| v.to_f32());
+            for i in 0..4 { assert!(approx(got[i], want[i], 0.02), "splat {} quat[{}] {} vs {}", s, i, got[i], want[i]); }
+        }
+    }
+
+    #[test]
+    fn spz_writes_non_finite_quaternion_as_identity() {
+        // One NaN or infinite component, in each position
+        let mut cases = Vec::new();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for k in 0..4 {
+                let mut quat = [0.0, 0.0, 0.0, 1.0];
+                quat[k] = bad;
+                cases.push(quat);
+            }
+        }
+        let mut arr = GsplatArray::new_capacity(cases.len(), 0);
+        for &quat in &cases {
+            arr.push_splat(make_splat([0.1, 0.2, 0.3], 0.7, [0.2, 0.5, 0.8], [0.5, 0.6, 0.7], quat), None, None, None);
+        }
+
+        let encoded = SpzEncoder::new(arr).with_fractional_bits(12).encode().expect("encode ok");
+        assert_eq!(spz_version(&spz_payload(&encoded)), 3);
+
+        let mut dec = SpzDecoder::new(GsplatArray::new());
+        dec.push(&encoded).expect("push ok");
+        dec.finish().expect("finish ok");
+        let out = dec.into_splats();
+
+        assert_eq!(out.len(), cases.len());
+        for (s, quat) in cases.iter().enumerate() {
+            let got = out.splats[s].quaternion.map(|v| v.to_f32());
+            assert_eq!(got, [0.0, 0.0, 0.0, 1.0], "splat {} from {:?}", s, quat);
+        }
+    }
+
+    #[test]
+    fn spz_rejects_unwritable_version() {
+        let mut arr = GsplatArray::new_capacity(1, 0);
+        arr.push_splat(make_splat([0.0, 0.0, 0.0], 0.5, [0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.0, 0.0, 0.0, 1.0]), None, None, None);
+        assert!(SpzEncoder::new(arr).with_version(1).encode().is_err());
+    }
+
+    #[test]
+    fn ext_rgb_roundtrip_within_half_step() {
+        // Magnitude steps per channel
+        const STEPS: f32 = 255.0;
+        // Lowest and highest ceilings, 2^-15 and 2^16
+        const LOWEST_CEILING: f32 = 1.0 / 32768.0;
+        const HIGHEST_CEILING: f32 = 65536.0;
+        // Each input with the smallest ceiling that holds its largest channel
+        let cases: [([f32; 3], f32); 10] = [
+            ([0.9, -0.6, -0.2], 1.0),
+            ([0.999, -0.6, -0.2], 1.0),
+            ([1.9, -1.2, -0.7], 2.0),
+            ([0.04, -0.035, -0.01], 0.0625),
+            ([0.5, -0.25, -0.1], 0.5),
+            ([0.5000001, -0.3, -0.1], 1.0),
+            ([5e-5, -4e-5, -1e-5], 2.0 * LOWEST_CEILING),
+            ([0.0, 0.0, 0.0], LOWEST_CEILING),
+            ([1e-6, -5e-7, -1e-7], LOWEST_CEILING),
+            ([60000.0, -30000.0, -1000.0], HIGHEST_CEILING),
+        ];
+        for (rgb, ceiling) in cases {
+            let half_step = ceiling / STEPS / 2.0;
+            // Also negated, and with the largest channel in each position
+            for [a, b, c] in [rgb, rgb.map(|x| -x)] {
+                for input in [[a, b, c], [c, a, b], [b, c, a]] {
+                    let decoded = decode_ext_rgb(encode_ext_rgb(input));
+                    for i in 0..3 {
+                        assert!(approx(decoded[i], input[i], half_step), "{:?}[{}] decoded as {}", input, i, decoded[i]);
+                        assert!(decoded[i] == 0.0 || (decoded[i] < 0.0) == (input[i] < 0.0), "{:?}[{}] sign lost", input, i);
+                    }
+                }
+            }
+        }
     }
 }
 

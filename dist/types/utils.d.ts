@@ -34,6 +34,7 @@ export declare function mapObject(obj: Record<string, unknown>, fn: (value: unkn
 export declare function mapFilterObject(obj: Record<string, unknown>, fn: (value: unknown, key: string) => unknown): Record<string, unknown>;
 export declare function getTransferable(ctx: unknown): Transferable[];
 export declare function newArray<T>(n: number, initFunction: (index: number) => T): T[];
+export declare function removeWhere<T>(array: T[], predicate: (item: T) => boolean): void;
 export declare class FreeList<T, Args> {
     items: T[];
     allocate: (args: Args) => T;
@@ -78,7 +79,9 @@ export declare function setPackedSplatRgb(packedSplats: Uint32Array, index: numb
     rgbMin?: number;
     rgbMax?: number;
 }): void;
-export declare function setPackedSplatOpacity(packedSplats: Uint32Array, index: number, opacity: number): void;
+export declare function setPackedSplatOpacity(packedSplats: Uint32Array, index: number, opacity: number, encoding?: {
+    lodOpacity?: boolean;
+}): void;
 export declare function unpackSplat(packedSplats: Uint32Array, index: number, encoding?: {
     rgbMin?: number;
     rgbMax?: number;

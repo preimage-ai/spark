@@ -1,6 +1,6 @@
-import { SplatEdit } from './SplatEdit';
-import { CovSplat, Dyno, DynoFloat, DynoMat3, DynoVal, DynoVec3, DynoVec4, Gsplat } from './dyno';
 import * as THREE from "three";
+import type { SplatEdit } from "./SplatEdit";
+import { CovSplat, Dyno, DynoFloat, DynoMat3, type DynoVal, DynoVec3, DynoVec4, Gsplat } from "./dyno";
 export type GsplatGenerator = Dyno<{
     index: "int";
 }, {
@@ -62,7 +62,15 @@ export interface FrameUpdateContext {
         texture: THREE.DataTexture;
     };
 }
-export declare class SplatGenerator extends THREE.Object3D {
+export interface SplatGeneratorEventMap extends THREE.Object3DEventMap {
+    /**
+     * Dispatched when asynchronous initialization completes and the splats are
+     * ready to render. Not dispatched for splats that are initialized on
+     * construction
+     */
+    initialized: object;
+}
+export declare class SplatGenerator extends THREE.Object3D<SplatGeneratorEventMap> {
     numSplats: number;
     generator?: GsplatGenerator;
     covGenerator?: CovSplatGenerator;

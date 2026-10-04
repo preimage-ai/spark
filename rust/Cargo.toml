@@ -9,9 +9,9 @@ resolver = "2"
 [workspace.package]
 rust-version = "1.82"
 edition = "2021"
-license = "Proprietary"
+license = "MIT"
 authors = ["World Labs Technologies"]
-repository = "https://github.com/sparkjs-dev/spark"
+repository = "https://github.com/sparkjsdev/spark"
 
 [workspace.dependencies]
 ahash = { version = "0.8.12", default-features = false, features = ["std", "compile-time-rng"] }
@@ -42,3 +42,17 @@ bytemuck = { version = "1.25.0", features = ["derive"] }
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+
+[workspace.lints.clippy]
+identity_op = "allow"
+len_without_is_empty = "allow"
+new_without_default = "allow"
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+let_and_return = "allow"
+clone_on_copy = "allow"
+type_complexity = "allow"
+wrong_self_convention = "allow"
+collapsible_if = "allow"
+needless_return = "allow"
+manual_range_contains = "allow"

@@ -1,3 +1,92 @@
+## 2.3.1 (Oct 1, 2026)
+
+Fix builds
+
+
+
+## 2.3.0 (Sep 29, 2026)
+
+Bug fixes and improvements
+
+
+### Enhancements
+
+- Fix / Enable on-demand rendering: Render a frame only when explicitly requested (#449, #451, #452) (fix #298) (@asundqui, @onderilkesever, @mrxz, @oscarlorentzon)
+- Make members of SplatEncoding non-optional to avoid repeated fallback handling (#415) (@mrxz)
+- Tree shaking improvements by focussing on classes that users might not need or use. (#417) (@mrxz)
+- Update dev dependencies: TypeScript and Vite, use Vitest for tests (#445) (@mrxz)
+- Use `instanceof` instead of `isTexture` flag for THREE.js type checking (#446) (@oscarlorentzon
+)
+- Add typechecking to CI (#427) (@oscarlorentzon)
+- Take extended splats (`ExtSplats`) when writing SPZ. `writeSpz` only took `PackedSplats` (#440) (@oscarlorentzon)
+- Accept cookie and header options when loading splats (#459) (@oscarlorentzon)
+- Use the calling renderer's encoding for its splats. Fix issue when using two `SparkRenderers` as when rendering two different viewpoints simultaneously (#453) (@oscarlorentzon)
+- Run the Rust tests in Linux CI (#444) (@oscarlorentzon)
+- Docs improvements (@mrxz, @oscarlorentzon, @mrxz)
+- Improve tests (@mrxz, @oscarlorentzon, @mrxz)
+
+### Bug Fixes
+
+- Fix a GPU resource memory leak. Dispose geometry and material in `SparkRenderer.dispose()` (#410) (@ArisLiWind, @mrxz)
+- Fix references to repo URL (#426) (@oscarlorentzon)
+- Write non-finite SPZ rotations as the identity. Issue when writting SPZ v3 (#454) (@oscarlorentzon)
+- Allocate missing SH3 data texture for paged ext splats. Addresses `RangeError: offset is out of bounds` error (#424) (@oscarlorentzon)
+- Await WebAssembly initialization and check sh degress in `transcodeSpz` (#438) (fix #437) (@mrxz)
+- Await for WebAssembly initialization before writing SPZ (#448) (@oscarlorentzon)
+- Make built-in controls rotate around the controlled object's up axis instead of world y axis (#434) (fix #300) (@dev-xdh, @oscarlorentzon)
+- Read and apply maxSh passed in PagedSplats options. Previously ignored and SplatPager limit applied instead (#447) (@oscarlorentzon)
+- Fix wrong raycaster direction for pinch and press movement under a rotated parent (#435) (@oscarlorentzon)
+- Controls: Skip pointer frames that took no time (#436) (@oscarlorentzon)
+- Apply default encoding when none is given when writting `PackedSplats` (#439) (@oscarlorentzon)
+- Make rotation speed of keys and gamepad (XR controllers) consistent (#442) (@oscarlorentzon)
+- Regression. Restore v3 as the default version when outputting SPZ format (#441) (@oscarlorentzon)
+- Cancel scheduled work (spark updates, splat sorting) when disposing the renderer (#450) (@oscarlorentzon)
+
+
+
+## 2.2.0 (Sep 11, 2026)
+
+Bug fixes and polish
+
+### Enhancements
+
+- Allow people to install the pre-built bundles from the repository directly without having to have the Rust toolchain setup on their machines (#354) (@mrxz)
+- Experimental (opt-in) faster LoD splat traversal algorithm (#344) (@asundqui, @mrxz)
+- Set provoking vertex to first explicitly if WEBGL_provoking_vertex extension is available. FPS perf gains up to 14% in some systems / configurations (#357) (@mrxz, @asundqui)
+- Clean up. Remove OldSparkRenderer and related classes (#322) (@mrxz)
+- Infer `encodeLinear` from the current render target instead of explicitly set (#360) (@mrxz)
+- Combine spark-worker-rs and spark-rs into one. Wasm blob is now embedded once and WASM module is compiled only once. (#335) (@mrxz)
+- Improve splat sorting. Up to ~20% faster (#327) (@39ali, @mrxz, @asundqui)
+- Prevent superfluous initial data upload to GPU (#358) (@mrxz, @asundqui)
+- Add WASM build step to CI dist build. (#377) (@mrxz)
+- Fix issue where Spark continues fetching and decoding the LoD chunks of the old scene after scene changes (fix #384) (#392) (@mrxz, @ChiefGnome, @ayamflow)
+- Handle `preUpdate` ahead of updating material uniforms to avoid 1 frame latency (fixes #390) (#391) (@mrxz, @peterreeves)
+- Add `gsplatXaxis`, `gsplatYAxis` and `gsplatZAxis` helper dynos indicating unit vector along splat axis (#419) (@asundqui, @oscarlorentzon)
+- Opt-in parameters to omit splat formats, splat representations and LOD generation methods from the WASM blob reducing its size (@mrxz, @asundqui) (#418)
+- Add `rust/`` folder to `build-dist.yml` paths (#412) (@mrxz)
+- Use type information of rpcHandlers for worker.call (#379) (@mrxz)
+- Call super.dispose() in Object3D subclasses for THREE.js r186+ (#413) (@mrxz)
+- Remove JS based splat file format decoders in favor ot Rust ones (#374) (@mrxz)
+- Add GLSL langauge hint before shader string literals for code editor syntax higlighting (@mrxz) (#416)
+- Unify logic to push data into decoder around `ReadableStream` (#380) (@mrxz)
+- Docs Improvements (@mrxz, @dmarcos)
+
+### Bug Fixes
+
+- Fix unspecified license ot rust code (#422) (@arslantariq-threshold)
+- Adress Rust compiler warnings (#361) (@mrxz)
+- Replace THREE.Clock (deprecated in THREE r183+) with THREE.Timer (#378) (@mrxz)
+- Replace explicit WebGL calls with equivalent `uploadU32DataTextureRows` call. Makes WebGL state consisten (fix #405) (#406) (@sawa-zen, @mrxz)
+- Fix RangeError when all SH arrays are present (#404) (@marwie, @mrxz)
+- Use uploadU32DataTextureRows for LoD index uploads (fix #405) (#406) (@sawa-zen, @mrxz)
+- Pass fileType to SplatPager when constructing SplatMesh (fix #363) (#365) (@mrxz, @fuxy-clude)
+- Prevent unclamped negative colors become NaN making splats render black (fix #386) (#387) (@viethungle0503, @mrxz)
+- Restore `pixelStorei` value since THREE r184+ now caches it (fix #366) (#367) (@mrxz, @Huciko)
+- Fix envmap regression. Save and restore activeCubeFace and activeMipmapLevel when rendering to render target (#315) (@mrxz)
+- Fix build-lod SH degree clamping logic (fix #352) (#359) (@asundqui, @mrxz)
+
+
+
 ## 2.1.0 (Apr 18, 2026)
 
 Bug fixes and adjustments post 2.0.0 release.

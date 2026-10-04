@@ -2,13 +2,22 @@
 use std::cell::RefCell;
 use js_sys::{Array, Float32Array, Object, Reflect, Uint8Array, Uint16Array, Uint32Array};
 use spark_lib::decoder::{ChunkReceiver, MultiDecoder, SplatEncoding, SplatFileType, SplatGetter};
+#[cfg(all(feature = "spz", feature = "gsplat"))]
+use spark_lib::spz::SpzEncoder;
+#[cfg(feature = "gsplat")]
+use spark_lib::gsplat::{GsplatSH1,GsplatSH2,GsplatSH3};
+#[cfg(feature = "gsplat")]
 use spark_lib::gsplat::GsplatArray as GsplatArrayInner;
+#[cfg(feature = "csplat")]
 use spark_lib::csplat::CsplatArray as CsplatArrayInner;
 use spark_lib::tsplat::TsplatArray;
 use wasm_bindgen::prelude::*;
 
+use crate::decoder::ChunkDecoder;
+#[cfg(feature = "gsplat")]
 use crate::ext_splats::ExtSplatsData;
-use crate::{decoder::ChunkDecoder, packed_splats::PackedSplatsData};
+#[cfg(feature = "csplat")]
+use crate::packed_splats::PackedSplatsData;
 
 mod raycast;
 use raycast::{raycast_packed_ellipsoids, raycast_ext_ellipsoids};
@@ -16,8 +25,15 @@ use raycast::{raycast_packed_ellipsoids, raycast_ext_ellipsoids};
 mod sort;
 use sort::{sort_internal, SortBuffers, sort32_internal, Sort32Buffers};
 
+#[cfg(feature = "gsplat")]
+mod transform;
+#[cfg(feature = "gsplat")]
+use transform::{transform_gsplatarray, TransformOptions};
+
 mod decoder;
+#[cfg(feature = "csplat")]
 mod packed_splats;
+#[cfg(feature = "gsplat")]
 mod ext_splats;
 
 mod lod_tree;
@@ -37,6 +53,16 @@ thread_local! {
     static SORT32_BUFFERS: RefCell<Sort32Buffers> = RefCell::new(Sort32Buffers::default());
 }
 
+macro_rules! stub_fn {
+    ($pred:meta, $name:ident) => {
+        #[cfg(not($pred))]
+        #[wasm_bindgen(variadic)]
+        pub fn $name(_args: &JsValue) -> Result<Object, JsValue> {
+            Err(JsValue::from(&format!("'{}' is disabled in this build, it requires: {}", stringify!($name), stringify!($pred))))
+        }
+    };
+}
+
 #[wasm_bindgen]
 pub fn sort_splats(
     num_splats: u32, readback: Uint16Array, ordering: Uint32Array,
@@ -51,14 +77,14 @@ pub fn sort_splats(
         let active_splats = match sort_internal(buffers, num_splats as usize) {
             Ok(active_splats) => active_splats,
             Err(err) => {
-                wasm_bindgen::throw_str(&format!("{}", err));
+                wasm_bindgen::throw_str(&err.to_string());
             }
         };
 
         if active_splats > 0 {
             // Copy out ordering result
             let subarray = &buffers.ordering[..active_splats as usize];
-            ordering.subarray(0, active_splats).copy_from(&subarray);
+            ordering.subarray(0, active_splats).copy_from(subarray);
         }
         active_splats
     });
@@ -80,14 +106,14 @@ pub fn sort32_splats(
         let active_splats = match sort32_internal(buffers, max_splats, num_splats as usize) {
             Ok(active_splats) => active_splats,
             Err(err) => {
-                wasm_bindgen::throw_str(&format!("{}", err));
+                wasm_bindgen::throw_str(&err.to_string());
             }
         };
 
         if active_splats > 0 {
             // Copy out ordering result
             let subarray = &buffers.ordering[..active_splats as usize];
-            ordering.subarray(0, active_splats).copy_from(&subarray);
+            ordering.subarray(0, active_splats).copy_from(subarray);
         }
         active_splats
     });
@@ -96,6 +122,7 @@ pub fn sort32_splats(
 }
 
 #[wasm_bindgen]
+#[cfg(feature = "csplat")]
 pub fn decode_to_packedsplats(
     file_type: Option<String>, path_name: Option<String>, encoding: JsValue,
     sh1_codes: Option<Uint32Array>, sh2_codes: Option<Uint32Array>, sh3_codes: Option<Uint32Array>,
@@ -130,8 +157,10 @@ pub fn decode_to_packedsplats(
     let decoder = ChunkDecoder::new(Box::new(decoder), Box::new(on_finish));
     Ok(decoder)
 }
+stub_fn!(feature = "csplat", decode_to_packedsplats);
 
 #[wasm_bindgen]
+#[cfg(feature = "gsplat")]
 pub fn decode_to_extsplats(
     file_type: Option<String>, path_name: Option<String>,
     sh1_codes: Option<Uint32Array>, sh2_codes: Option<Uint32Array>, sh3_codes: Option<Array>,
@@ -160,15 +189,18 @@ pub fn decode_to_extsplats(
     let decoder = ChunkDecoder::new(Box::new(decoder), Box::new(on_finish));
     Ok(decoder)
 }
+stub_fn!(feature = "gsplat", decode_to_extsplats);
 
 #[wasm_bindgen]
 #[allow(non_snake_case)]
+#[cfg(feature = "gsplat")]
 pub struct GsplatArray {
     pub numSplats: usize,
     pub maxShDegree: usize,
     inner: GsplatArrayInner,
 }
 
+#[cfg(feature = "gsplat")]
 impl GsplatArray {
     pub fn new(inner: GsplatArrayInner) -> Self {
         Self {
@@ -179,7 +211,9 @@ impl GsplatArray {
     }
 }
 
+
 #[wasm_bindgen]
+#[cfg(feature = "gsplat")]
 impl GsplatArray {
     pub fn len(&self) -> usize {
         self.inner.len()
@@ -194,6 +228,7 @@ impl GsplatArray {
     //     // spark_lib::quick_lod::compute_lod_tree(&mut self.inner, lod_base, merge_filter, |_s| {});
     // }
 
+    #[cfg(feature = "tiny_lod")]
     pub fn tiny_lod(&mut self, lod_base: f32, merge_filter: bool) {
         // let log = |s: &str| web_sys::console::log_1(&JsValue::from(s));
         let log = |_s: &str| {};
@@ -203,6 +238,7 @@ impl GsplatArray {
         spark_lib::chunk_tree::chunk_tree(&mut self.inner, 0, log);
     }
 
+    #[cfg(feature = "bhatt_lod")]
     pub fn bhatt_lod(&mut self, lod_base: f32) {
         // let log = |s: &str| web_sys::console::log_1(&JsValue::from(s));
         let log = |_s: &str| {};
@@ -212,6 +248,7 @@ impl GsplatArray {
         spark_lib::chunk_tree::chunk_tree(&mut self.inner, 0, log);
     }
 
+    #[cfg(feature = "csplat")]
     pub fn to_packedsplats(&self, encoding: JsValue) -> Result<Object, JsValue> {
         let encoding = if encoding.is_falsy() {
             None
@@ -225,6 +262,7 @@ impl GsplatArray {
         Ok(splats.into_splat_object())
     }
 
+    #[cfg(feature = "csplat")]
     pub fn to_packedsplats_lod(&self, encoding: JsValue) -> Result<Object, JsValue> {
         let encoding = if encoding.is_falsy() {
             None
@@ -238,6 +276,7 @@ impl GsplatArray {
         Ok(splats.into_splat_object())
     }
 
+    #[cfg(feature = "gsplat")]
     pub fn to_extsplats(&self) -> Result<Object, JsValue> {
         let splats = match ExtSplatsData::new_from_tsplat_array(&self.inner) {
             Err(err) => { return Err(JsValue::from(err.to_string())); },
@@ -246,6 +285,7 @@ impl GsplatArray {
         Ok(splats.into_splat_object())
     }
 
+    #[cfg(feature = "gsplat")]
     pub fn to_extsplats_lod(&self) -> Result<Object, JsValue> {
         let splats = match ExtSplatsData::new_from_tsplat_array_lod(&self.inner) {
             Err(err) => { return Err(JsValue::from(err.to_string())); },
@@ -257,9 +297,41 @@ impl GsplatArray {
     pub fn inject_rgba8(&mut self, rgba: Uint8Array) {
         self.inner.inject_rgba8(&rgba.to_vec());
     }
+
+    pub fn transform(&mut self, transform: JsValue) -> Result<(), JsValue> {
+        let transform_options: TransformOptions = serde_wasm_bindgen::from_value(transform)?;
+        transform_gsplatarray(&mut self.inner, transform_options);
+        Ok(())
+    }
+
+    pub fn concat(&mut self, other: &mut GsplatArray) -> Result<(), JsValue> {
+        for i in 0..other.inner.len() {
+            let sh1 = if other.maxShDegree >= 1 { other.inner.sh1[i].clone() } else { GsplatSH1::default() };
+            let sh2 = if other.maxShDegree >= 2 { other.inner.sh2[i].clone() } else { GsplatSH2::default() };
+            let sh3 = if other.maxShDegree >= 3 { other.inner.sh3[i].clone() } else { GsplatSH3::default() };
+            self.inner.push_splat(other.inner.get(i).clone(), Some(sh1), Some(sh2), Some(sh3));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "spz")]
+    pub fn encode_to_spz(mut self, max_sh: u32, fractional_bits: u8, version: Option<u32>) -> Result<Uint8Array, JsValue> {
+        self.inner.clamp_sh_degree(max_sh as usize);
+        self.maxShDegree = self.inner.max_sh_degree;
+        let mut encoder = SpzEncoder::new(self.inner).with_max_sh(max_sh as usize).with_fractional_bits(fractional_bits);
+        if let Some(version) = version {
+            encoder = encoder.with_version(version);
+        }
+        let encoded = match encoder.encode() {
+            Err(err) => { return Err(JsValue::from(err.to_string())); },
+            Ok(encoded) => encoded
+        };
+        Ok(Uint8Array::from(encoded.as_slice()))
+    }
 }
 
 #[wasm_bindgen]
+#[cfg(feature = "gsplat")]
 pub fn decode_to_gsplatarray(file_type: Option<String>, path_name: Option<String>) -> Result<ChunkDecoder, JsValue> {
     let file_type = if let Some(file_type) = file_type {
         match SplatFileType::from_enum_str(&file_type) {
@@ -281,10 +353,16 @@ pub fn decode_to_gsplatarray(file_type: Option<String>, path_name: Option<String
     let decoder = ChunkDecoder::new(Box::new(decoder), Box::new(on_finish));
     Ok(decoder)
 }
+stub_fn!(feature = "gsplat", decode_to_gsplatarray);
 
 #[wasm_bindgen]
+#[cfg(all(feature = "csplat", feature = "gsplat"))]
 pub fn packedsplats_to_gsplatarray(num_splats: u32, packed: Uint32Array, extra: Option<Object>, encoding: JsValue) -> Result<GsplatArray, JsValue> {
-    let encoding = serde_wasm_bindgen::from_value(encoding)?;
+    let encoding = if encoding.is_falsy() {
+        SplatEncoding::default()
+    } else {
+        serde_wasm_bindgen::from_value(encoding)?
+    };
     let mut receiver = match PackedSplatsData::from_js_arrays(packed, num_splats as usize, extra.as_ref(), encoding) {
         Ok(receiver) => receiver,
         Err(err) => { return Err(JsValue::from(err.to_string())); }
@@ -295,15 +373,18 @@ pub fn packedsplats_to_gsplatarray(num_splats: u32, packed: Uint32Array, extra: 
     };
     Ok(GsplatArray::new(splats))
 }
+stub_fn!(all(feature = "csplat", feature = "gsplat"), packedsplats_to_gsplatarray);
 
 #[wasm_bindgen]
 #[allow(non_snake_case)]
+#[cfg(feature = "csplat")]
 pub struct CsplatArray {
     pub numSplats: usize,
     pub maxShDegree: usize,
     inner: CsplatArrayInner,
 }
 
+#[cfg(feature = "csplat")]
 impl CsplatArray {
     pub fn new(inner: CsplatArrayInner) -> Self {
         Self {
@@ -315,6 +396,7 @@ impl CsplatArray {
 }
 
 #[wasm_bindgen]
+#[cfg(feature = "csplat")]
 impl CsplatArray {
     pub fn len(&self) -> usize {
         self.inner.len()
@@ -324,6 +406,7 @@ impl CsplatArray {
         self.inner.has_children()
     }
 
+    #[cfg(feature = "tiny_lod")]
     pub fn tiny_lod(&mut self, lod_base: f32, merge_filter: bool) {
         // let log = |s: &str| web_sys::console::log_1(&JsValue::from(s));
         let log = |_s: &str| {};
@@ -333,6 +416,7 @@ impl CsplatArray {
         spark_lib::chunk_tree::chunk_tree(&mut self.inner, 0, log);
     }
 
+    #[cfg(feature = "bhatt_lod")]
     pub fn bhatt_lod(&mut self, lod_base: f32) {
         // let log = |s: &str| web_sys::console::log_1(&JsValue::from(s));
         let log = |_s: &str| {};
@@ -360,6 +444,7 @@ impl CsplatArray {
         Ok(splats.into_splat_object())
     }
 
+    #[cfg(feature = "gsplat")]
     pub fn to_extsplats(&self) -> Result<Object, JsValue> {
         let splats = match ExtSplatsData::new_from_tsplat_array(&self.inner) {
             Err(err) => { return Err(JsValue::from(err.to_string())); },
@@ -368,6 +453,7 @@ impl CsplatArray {
         Ok(splats.into_splat_object())
     }
 
+    #[cfg(feature = "gsplat")]
     pub fn to_extsplats_lod(&self) -> Result<Object, JsValue> {
         let splats = match ExtSplatsData::new_from_tsplat_array_lod(&self.inner) {
             Err(err) => { return Err(JsValue::from(err.to_string())); },
@@ -382,6 +468,7 @@ impl CsplatArray {
 }
 
 #[wasm_bindgen]
+#[cfg(feature = "csplat")]
 pub fn decode_to_csplatarray(file_type: Option<String>, path_name: Option<String>, encoding: JsValue) -> Result<ChunkDecoder, JsValue> {
     let file_type = if let Some(file_type) = file_type {
         match SplatFileType::from_enum_str(&file_type) {
@@ -408,10 +495,16 @@ pub fn decode_to_csplatarray(file_type: Option<String>, path_name: Option<String
     let decoder = ChunkDecoder::new(Box::new(decoder), Box::new(on_finish));
     Ok(decoder)
 }
+stub_fn!(feature = "csplat", decode_to_csplatarray);
 
 #[wasm_bindgen]
+#[cfg(feature = "csplat")]
 pub fn packedsplats_to_csplatarray(num_splats: u32, packed: Uint32Array, extra: Option<Object>, encoding: JsValue) -> Result<CsplatArray, JsValue> {
-    let encoding = serde_wasm_bindgen::from_value(encoding)?;
+    let encoding = if encoding.is_falsy() {
+        SplatEncoding::default()
+    } else {
+        serde_wasm_bindgen::from_value(encoding)?
+    };
     let mut receiver = match PackedSplatsData::from_js_arrays(packed, num_splats as usize, extra.as_ref(), encoding) {
         Ok(receiver) => receiver,
         Err(err) => { return Err(JsValue::from(err.to_string())); }
@@ -424,6 +517,7 @@ pub fn packedsplats_to_csplatarray(num_splats: u32, packed: Uint32Array, extra: 
 }
 
 #[wasm_bindgen]
+#[cfg(feature = "gsplat")]
 pub fn extsplats_to_gsplatarray(num_splats: u32, ext1: Uint32Array, ext2: Uint32Array, extra: Option<Object>) -> Result<GsplatArray, JsValue> {
     let mut receiver = match ExtSplatsData::from_js_arrays([ext1, ext2], num_splats as usize, extra.as_ref()) {
         Ok(receiver) => receiver,
@@ -435,8 +529,10 @@ pub fn extsplats_to_gsplatarray(num_splats: u32, ext1: Uint32Array, ext2: Uint32
     };
     Ok(GsplatArray::new(splats))
 }
+stub_fn!(feature = "gsplat", extsplats_to_gsplatarray);
 
 #[wasm_bindgen]
+#[cfg(all(feature = "csplat", feature = "tiny_lod"))]
 pub fn tiny_lod_packedsplats(num_splats: u32, packed: Uint32Array, extra: Option<Object>, lod_base: f32, merge_filter: bool, rgba: Option<Uint8Array>, encoding: JsValue) -> Result<Object, JsValue> {
     let mut gs = packedsplats_to_csplatarray(num_splats, packed, extra, encoding)?;
     if let Some(rgba) = rgba {
@@ -445,8 +541,10 @@ pub fn tiny_lod_packedsplats(num_splats: u32, packed: Uint32Array, extra: Option
     gs.tiny_lod(lod_base, merge_filter);
     gs.to_packedsplats_lod()
 }
+stub_fn!(all(feature = "csplat", feature = "tiny_lod"), tiny_lod_packedsplats);
 
 #[wasm_bindgen]
+#[cfg(all(feature = "csplat", feature = "bhatt_lod"))]
 pub fn bhatt_lod_packedsplats(num_splats: u32, packed: Uint32Array, extra: Option<Object>, lod_base: f32, rgba: Option<Uint8Array>, encoding: JsValue) -> Result<Object, JsValue> {
     let mut gs = packedsplats_to_csplatarray(num_splats, packed, extra, encoding)?;
     if let Some(rgba) = rgba {
@@ -455,8 +553,10 @@ pub fn bhatt_lod_packedsplats(num_splats: u32, packed: Uint32Array, extra: Optio
     gs.bhatt_lod(lod_base);
     gs.to_packedsplats_lod()
 }
+stub_fn!(all(feature = "csplat", feature = "bhatt_lod"), bhatt_lod_packedsplats);
 
 #[wasm_bindgen]
+#[cfg(all(feature = "gsplat", feature = "tiny_lod"))]
 pub fn tiny_lod_extsplats(num_splats: u32, ext1: Uint32Array, ext2: Uint32Array, extra: Option<Object>, lod_base: f32, merge_filter: bool, rgba: Option<Uint8Array>) -> Result<Object, JsValue> {
     let mut gs = extsplats_to_gsplatarray(num_splats, ext1, ext2, extra)?;
     if let Some(rgba) = rgba {
@@ -465,8 +565,10 @@ pub fn tiny_lod_extsplats(num_splats: u32, ext1: Uint32Array, ext2: Uint32Array,
     gs.tiny_lod(lod_base, merge_filter);
     gs.to_extsplats_lod()
 }
+stub_fn!(all(feature = "gsplat", feature = "tiny_lod"), tiny_lod_extsplats);
 
 #[wasm_bindgen]
+#[cfg(all(feature = "gsplat", feature = "bhatt_lod"))]
 pub fn bhatt_lod_extsplats(num_splats: u32, ext1: Uint32Array, ext2: Uint32Array, extra: Option<Object>, lod_base: f32, rgba: Option<Uint8Array>) -> Result<Object, JsValue> {
     let mut gs = extsplats_to_gsplatarray(num_splats, ext1, ext2, extra)?;
     if let Some(rgba) = rgba {
@@ -475,6 +577,7 @@ pub fn bhatt_lod_extsplats(num_splats: u32, ext1: Uint32Array, ext2: Uint32Array
     gs.bhatt_lod(lod_base);
     gs.to_extsplats_lod()
 }
+stub_fn!(all(feature = "gsplat", feature = "bhatt_lod"), bhatt_lod_extsplats);
 
 const RAYCAST_BUFFER_COUNT: usize = 65536;
 
@@ -485,14 +588,14 @@ thread_local! {
 #[wasm_bindgen]
 pub fn get_raycast_buffer() -> Uint32Array {
     RAYCAST_BUFFERS.with_borrow_mut(|(buffer, _, _)| {
-        unsafe { Uint32Array::view(&buffer) }
+        unsafe { Uint32Array::view(buffer) }
     })
 }
 
 #[wasm_bindgen]
 pub fn get_raycast_buffer2() -> Uint32Array {
     RAYCAST_BUFFERS.with_borrow_mut(|(_, buffer, _)| {
-        unsafe { Uint32Array::view(&buffer) }
+        unsafe { Uint32Array::view(buffer) }
     })
 }
 
@@ -520,7 +623,7 @@ pub fn raycast_packed_buffer(
             min_opacity, near, far, &encoding,
         );
 
-        unsafe { Float32Array::view(&distances) }
+        unsafe { Float32Array::view(distances) }
     })
 }
 
@@ -541,7 +644,7 @@ pub fn raycast_ext_buffers(
             min_opacity, near, far,
         );
 
-        unsafe { Float32Array::view(&distances) }
+        unsafe { Float32Array::view(distances) }
     })
 }
 
@@ -561,7 +664,7 @@ pub fn raycast_packed_splats(
         ..Default::default()
     };
 
-    _ = RAYCAST_BUFFERS.with_borrow_mut(|(buffer, _, _)| {
+    RAYCAST_BUFFERS.with_borrow_mut(|(buffer, _, _)| {
         let mut base = 0;
         while base < num_splats {
             let chunk_size = (RAYCAST_BUFFER_COUNT as u32).min(num_splats - base);
@@ -585,6 +688,7 @@ pub fn raycast_packed_splats(
 }
 
 #[wasm_bindgen]
+#[cfg(feature = "rad")]
 pub fn decode_rad_header(bytes: Uint8Array) -> Result<JsValue, JsValue> {
     let bytes = bytes.to_vec();
     let meta_chunks_start = match spark_lib::rad::decode_rad_header(&bytes) {
@@ -600,3 +704,4 @@ pub fn decode_rad_header(bytes: Uint8Array) -> Result<JsValue, JsValue> {
         Ok(JsValue::null())
     }
 }
+stub_fn!(feature = "rad", decode_rad_header);

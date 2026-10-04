@@ -108,6 +108,12 @@ export const combineGsplat = ({
 };
 export const gsplatNormal = (gsplat: DynoVal<typeof Gsplat>): DynoVal<"vec3"> =>
   new GsplatNormal({ gsplat });
+export const gsplatXAxis = (gsplat: DynoVal<typeof Gsplat>): DynoVal<"vec3"> =>
+  new GsplatXAxis({ gsplat });
+export const gsplatYAxis = (gsplat: DynoVal<typeof Gsplat>): DynoVal<"vec3"> =>
+  new GsplatYAxis({ gsplat });
+export const gsplatZAxis = (gsplat: DynoVal<typeof Gsplat>): DynoVal<"vec3"> =>
+  new GsplatZAxis({ gsplat });
 
 export const transformGsplat = (
   gsplat: DynoVal<typeof Gsplat>,
@@ -132,7 +138,7 @@ export const splatTexCoord = (index: DynoVal<"int">): DynoVal<"ivec3"> =>
 export const pagedSplatTexCoord = (index: DynoVal<"int">): DynoVal<"ivec3"> =>
   new PagedSplatTexCoord({ index });
 
-export const defineGsplat = unindent(`
+export const defineGsplat = unindent(/* glsl */ `
   struct Gsplat {
     vec3 center;
     uint flags;
@@ -148,7 +154,7 @@ export const defineGsplat = unindent(`
   }
 `);
 
-export const defineCovSplat = unindent(`
+export const defineCovSplat = unindent(/* glsl */ `
   struct CovSplat {
     vec3 center;
     uint flags;
@@ -163,7 +169,7 @@ export const defineCovSplat = unindent(`
   }
 `);
 
-export const definePackedSplats = unindent(`
+export const definePackedSplats = unindent(/* glsl */ `
   struct PackedSplats {
     usampler2DArray textureArray;
     int numSplats;
@@ -187,7 +193,7 @@ export class NumPackedSplats extends UnaryOp<
   }
 }
 
-const defineReadPackedArray = unindent(`
+const defineReadPackedArray = unindent(/* glsl */ `
   bool readPackedArray(usampler2DArray texture, int numSplats, vec4 rgbMinMaxLnScaleMinMax, int index, out Gsplat gsplat) {
     if ((index >= 0) && (index < numSplats)) {
       uvec4 packedData = texelFetch(texture, splatTexCoord(index), 0);
@@ -223,7 +229,7 @@ export class ReadPackedSplat
         const { packedSplats, index } = inputs;
         let statements: string[];
         if (packedSplats && index) {
-          statements = unindentLines(`
+          statements = unindentLines(/* glsl */ `
             ${gsplat}.flags = 0u;
             if (readPackedArray(${packedSplats}.textureArray, ${packedSplats}.numSplats, ${packedSplats}.rgbMinMaxLnScaleMinMax, ${index}, ${gsplat})) {
               if (${packedSplats}.lodOpacity) {
@@ -288,7 +294,7 @@ export class ReadPackedSplatRange
         const { packedSplats, index, base, count } = inputs;
         let statements: string[];
         if (packedSplats && index && base && count) {
-          statements = unindentLines(`
+          statements = unindentLines(/* glsl */ `
             ${gsplat}.flags = 0u;
             if (readPackedArray(${packedSplats}.textureArray, ${packedSplats}.numSplats, ${packedSplats}.rgbMinMaxLnScaleMinMax, ${index}, ${gsplat})) {
               if (${packedSplats}.lodOpacity) {
@@ -312,7 +318,7 @@ export class ReadPackedSplatRange
   }
 }
 
-export const defineExtSplats = unindent(`
+export const defineExtSplats = unindent(/* glsl */ `
   struct ExtSplats {
     usampler2DArray textureArray1;
     usampler2DArray textureArray2;
@@ -333,7 +339,7 @@ export class NumExtSplats extends UnaryOp<
   }
 }
 
-const defineReadExtArrays = unindent(`
+const defineReadExtArrays = unindent(/* glsl */ `
   void readExtArrays(usampler2DArray texture1, usampler2DArray texture2, int numSplats, int index, out Gsplat gsplat) {
     gsplat.flags = 0u;
     if ((index >= 0) && (index < numSplats)) {
@@ -371,7 +377,7 @@ export class ReadExtSplat
         const { extSplats, index } = inputs;
         let statements: string[];
         if (extSplats && index) {
-          return unindentLines(`
+          return unindentLines(/* glsl */ `
             readExtArrays(${extSplats}.textureArray1, ${extSplats}.textureArray2, ${extSplats}.numSplats, ${index}, ${gsplat});
           `);
         }
@@ -398,7 +404,7 @@ export class NumCovSplats extends UnaryOp<
   }
 }
 
-const defineReadCovArrays = unindent(`
+const defineReadCovArrays = unindent(/* glsl */ `
   void readCovArrays(usampler2DArray texture1, usampler2DArray texture2, int numSplats, int index, out CovSplat covsplat) {
     covsplat.flags = 0u;
     if ((index >= 0) && (index < numSplats)) {
@@ -436,7 +442,7 @@ export class ReadCovSplat
         const { covSplats, index } = inputs;
         let statements: string[];
         if (covSplats && index) {
-          return unindentLines(`
+          return unindentLines(/* glsl */ `
             readCovArrays(${covSplats}.textureArray, ${covSplats}.numSplats, ${index}, ${covsplat});
           `);
         }
@@ -467,7 +473,7 @@ export class GsplatToCovSplat extends Dyno<
           return [`${covsplat}.flags = 0u;`];
         }
 
-        return unindentLines(`
+        return unindentLines(/* glsl */ `
           ${covsplat}.flags = 0u;
           if (isGsplatActive(${gsplat}.flags)) {
             ${covsplat}.flags = ${gsplat}.flags;
@@ -726,7 +732,7 @@ export class CombineGsplat
   }
 }
 
-export const defineGsplatNormal = unindent(`
+export const defineGsplatNormal = unindent(/* glsl */ `
   vec3 gsplatNormal(vec3 scales, vec4 quaternion) {
     float minScale = min(scales.x, min(scales.y, scales.z));
     vec3 normal;
@@ -747,6 +753,36 @@ export class GsplatNormal extends UnaryOp<typeof Gsplat, "vec3", "normal"> {
     this.globals = () => [defineGsplat, defineGsplatNormal];
     this.statements = ({ inputs, outputs }) => [
       `${outputs.normal} = gsplatNormal(${inputs.a}.scales, ${inputs.a}.quaternion);`,
+    ];
+  }
+}
+
+export class GsplatXAxis extends UnaryOp<typeof Gsplat, "vec3", "xaxis"> {
+  constructor({ gsplat }: { gsplat: DynoVal<typeof Gsplat> }) {
+    super({ a: gsplat, outKey: "xaxis", outTypeFunc: () => "vec3" });
+    this.globals = () => [defineGsplat];
+    this.statements = ({ inputs, outputs }) => [
+      `${outputs.xaxis} = quatVec(${inputs.a}.quaternion, vec3(1.0, 0.0, 0.0));`,
+    ];
+  }
+}
+
+export class GsplatYAxis extends UnaryOp<typeof Gsplat, "vec3", "yaxis"> {
+  constructor({ gsplat }: { gsplat: DynoVal<typeof Gsplat> }) {
+    super({ a: gsplat, outKey: "yaxis", outTypeFunc: () => "vec3" });
+    this.globals = () => [defineGsplat];
+    this.statements = ({ inputs, outputs }) => [
+      `${outputs.yaxis} = quatVec(${inputs.a}.quaternion, vec3(0.0, 1.0, 0.0));`,
+    ];
+  }
+}
+
+export class GsplatZAxis extends UnaryOp<typeof Gsplat, "vec3", "zaxis"> {
+  constructor({ gsplat }: { gsplat: DynoVal<typeof Gsplat> }) {
+    super({ a: gsplat, outKey: "zaxis", outTypeFunc: () => "vec3" });
+    this.globals = () => [defineGsplat];
+    this.statements = ({ inputs, outputs }) => [
+      `${outputs.zaxis} = quatVec(${inputs.a}.quaternion, vec3(0.0, 0.0, 1.0));`,
     ];
   }
 }

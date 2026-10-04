@@ -11,7 +11,7 @@ Copy and paste code below in an `index.html` file or remix in the [Web Playgroun
     "imports": {
       "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
       "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
-      "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/2.1.0/spark.module.js"
+      "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/2.3.1/spark.module.js"
     }
   }
 </script>
@@ -65,6 +65,7 @@ This will run a Web server at [http://localhost:8080/](http://localhost:8080/) w
 - [Spark Overview](overview.md)
 - [System Design](system-design.md)
 - [SparkRenderer](spark-renderer.md)
+- [On-demand rendering](on-demand-rendering.md)
 - [SplatMesh](splat-mesh.md)
 - [PackedSplats](packed-splats.md)
 - [ExtSplats](ext-splats.md)

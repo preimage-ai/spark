@@ -2,11 +2,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { defineConfig } from "vite";
 import arraybuffer from "vite-plugin-arraybuffer";
-import dts from "vite-plugin-dts";
 import glsl from "vite-plugin-glsl";
 
 const sparkRsDirectory = "rust/spark-rs/pkg";
-if (!fs.existsSync(sparkRsDirectory)) {
+if (!fs.existsSync(sparkRsDirectory) && !process.env.VITEST) {
   console.error(
     "\x1b[31m************************************************************************\x1b[0m",
   );
@@ -50,15 +49,13 @@ export default defineConfig(({ mode }) => {
         include: ["**/*.glsl"],
       }),
 
-      dts({ outDir: "dist/types" }),
-
       {
         name: "serve-node-modules-alias",
         configureServer(server) {
           const baseUrlPath = "/examples/js/vendor/";
 
           server.middlewares.use((req, res, next) => {
-            if (!req.url.startsWith(baseUrlPath)) return next();
+            if (!req.url?.startsWith(baseUrlPath)) return next();
 
             const relModulePath = req.url.slice(baseUrlPath.length); // safe substring
             const absPath = path.resolve("node_modules", relModulePath);
@@ -89,7 +86,7 @@ export default defineConfig(({ mode }) => {
     build: {
       minify: isMinify,
       lib: {
-        entry: path.resolve(__dirname, "src/index.ts"),
+        entry: path.resolve(import.meta.dirname, "src/index.ts"),
         name: "spark",
         formats: ["es", "cjs"],
         fileName: (format) => {
@@ -111,7 +108,7 @@ export default defineConfig(({ mode }) => {
 
     worker: {
       rollupOptions: {
-        treeshake: "smallest",
+        treeshake: true,
       },
       plugins: () => [
         glsl({
@@ -132,8 +129,17 @@ export default defineConfig(({ mode }) => {
       exclude: ["three"], // prevent Vite pre-bundling
     },
 
+    // Expose SPARK_* env vars on import.meta.env (e.g. SPARK_ENABLE_HOOKS for
+    // the test-only await points in src/hooks.ts). Unset vars are absent, so
+    // checks against them fold to false in normal builds.
+    envPrefix: ["VITE_", "SPARK_"],
+
     define: {
       sparkLocalAssets: localAssetsDirectoryExist,
+    },
+
+    test: {
+      setupFiles: ["test/unit/setup.ts"],
     },
   };
 });

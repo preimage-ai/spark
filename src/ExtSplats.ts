@@ -30,6 +30,11 @@ export type ExtSplatsOptions = {
   // URL to fetch a Gaussian splat file from (supports .ply, .splat, .ksplat,
   // .spz formats). (default: undefined)
   url?: string;
+  // Extra HTTP headers to send when fetching from url. (default: undefined)
+  requestHeader?: Record<string, string>;
+  // Send cookies and other credentials when fetching from url, including
+  // cross-origin requests. (default: false)
+  withCredentials?: boolean;
   // Raw bytes of a Gaussian splat file to decode directly instead of fetching
   // from URL. (default: undefined)
   fileBytes?: Uint8Array | ArrayBuffer;
@@ -174,6 +179,8 @@ export class ExtSplats implements SplatSource {
       fileName,
       stream,
       streamLength,
+      requestHeader,
+      withCredentials,
       construct,
       lod,
       nonLod,
@@ -183,6 +190,10 @@ export class ExtSplats implements SplatSource {
     this.nonLod = nonLod;
 
     const loader = new SplatLoader();
+    if (requestHeader) {
+      loader.setRequestHeader(requestHeader);
+    }
+    loader.setWithCredentials(withCredentials ?? false);
     if (fileBytes || url || stream) {
       await loader.loadInternalAsync({
         extSplats: this,
@@ -230,7 +241,7 @@ export class ExtSplats implements SplatSource {
       >;
       if (dyno instanceof DynoUniform) {
         const texture = dyno.value;
-        if (texture?.isTexture) {
+        if (texture instanceof THREE.Texture) {
           texture.dispose();
           texture.source.data = null;
         }
@@ -690,7 +701,10 @@ export class ExtSplats implements SplatSource {
         : quality
           ? 1.75
           : 1.5;
-    const extArrays = [this.extArrays[0].slice(), this.extArrays[1].slice()];
+    const extArrays = [
+      this.extArrays[0].slice(),
+      this.extArrays[1].slice(),
+    ] as const;
     const rgba = rgbaArray ? (await rgbaArray.getArray()).slice() : undefined;
     const extra = {
       sh1: this.extra.sh1 ? (this.extra.sh1 as Uint32Array).slice() : undefined,
@@ -698,7 +712,7 @@ export class ExtSplats implements SplatSource {
       sh3: this.extra.sh3 ? (this.extra.sh3 as Uint32Array).slice() : undefined,
     };
     const decoded = await workerPool.withWorker(async (worker) => {
-      return (await worker.call(
+      return await worker.call(
         quality ? "qualityLodExtSplats" : "tinyLodExtSplats",
         {
           numSplats: this.numSplats,
@@ -707,11 +721,7 @@ export class ExtSplats implements SplatSource {
           lodBase,
           rgba,
         },
-      )) as {
-        numSplats: number;
-        extArrays: [Uint32Array, Uint32Array];
-        extra: Record<string, unknown>;
-      };
+      );
     });
 
     const lodSplats = new ExtSplats(decoded);
@@ -778,7 +788,7 @@ export class DynoExtSplats extends DynoUniform<
   }
 }
 
-export const defineEvaluateExtSH1 = unindent(`
+export const defineEvaluateExtSH1 = unindent(/* glsl */ `
   vec3 evaluateExtSH1(uvec4 packedData, vec3 viewDir) {
     vec3 sh1_0 = decodeExtRgb(packedData.x);
     vec3 sh1_1 = decodeExtRgb(packedData.y);
@@ -790,7 +800,7 @@ export const defineEvaluateExtSH1 = unindent(`
   }
 `);
 
-export const defineEvaluateExtSH12 = unindent(`
+export const defineEvaluateExtSH12 = unindent(/* glsl */ `
   vec3 evaluateExtSH12(uvec4 packed1, uvec4 packed2, vec3 viewDir) {
     vec3 sh1_0 = decodeExtRgb(packed1.x);
     vec3 sh1_1 = decodeExtRgb(packed1.y);
@@ -816,7 +826,7 @@ export const defineEvaluateExtSH12 = unindent(`
   }
 `);
 
-export const defineEvaluateExtSH3 = unindent(`
+export const defineEvaluateExtSH3 = unindent(/* glsl */ `
   vec3 evaluateExtSH3(uvec4 packedA, uvec4 packedB, vec3 viewDir) {
     vec3 sh3_0 = decodeExtRgb(packedA.x);
     vec3 sh3_1 = decodeExtRgb(packedA.y);
@@ -890,7 +900,7 @@ export function evaluateExtSH({
       if (inputs.sh1Texture) {
         if (!inputs.sh2Texture) {
           lines.push(
-            ...unindentLines(`
+            ...unindentLines(/* glsl */ `
             if (${inputs.numSh} >= 1) {
               rgb = evaluateExtSH1(texelFetch(${inputs.sh1Texture}, ${inputs.coord}, 0), ${inputs.viewDir});
             }
@@ -898,7 +908,7 @@ export function evaluateExtSH({
           );
         } else {
           lines.push(
-            ...unindentLines(`
+            ...unindentLines(/* glsl */ `
             if (${inputs.numSh} == 1) {
               rgb = evaluateExtSH1(texelFetch(${inputs.sh1Texture}, ${inputs.coord}, 0), ${inputs.viewDir});
             } else if (${inputs.numSh} >= 2) {
@@ -908,7 +918,7 @@ export function evaluateExtSH({
 
           if (inputs.sh3TextureA && inputs.sh3TextureB) {
             lines.push(
-              ...unindentLines(`
+              ...unindentLines(/* glsl */ `
               if (${inputs.numSh} >= 3) {
                 rgb += evaluateExtSH3(texelFetch(${inputs.sh3TextureA}, ${inputs.coord}, 0), texelFetch(${inputs.sh3TextureB}, ${inputs.coord}, 0), ${inputs.viewDir});
               }

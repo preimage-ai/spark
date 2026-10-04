@@ -4,8 +4,7 @@ import { ExtSplats, type ExtSplatsOptions } from "./ExtSplats";
 import { PackedSplats, type PackedSplatsOptions } from "./PackedSplats";
 import { SplatMesh } from "./SplatMesh";
 import { workerPool } from "./SplatWorker";
-import { type SplatEncoding, SplatFileType } from "./defines";
-import { PlyReader } from "./ply";
+import { type ExtResult, type PackedResult, SplatFileType } from "./defines";
 import { decompressPartialGzip, getTextureSize } from "./utils";
 
 // SplatLoader implements the THREE.Loader interface and supports loading a variety
@@ -113,19 +112,6 @@ export class SplatLoader extends Loader {
           nonLod = splatsNonLod;
         }
 
-        // let init: {
-        //   numSplats: number;
-        //   packedArray: Uint32Array;
-        //   extra: Record<string, unknown>;
-        //   splatEncoding: SplatEncoding;
-        // } | null = null;
-        // let initExt: {
-        //   numSplats: number;
-        //   ext0: Uint32Array;
-        //   ext1: Uint32Array;
-        //   extra: Record<string, unknown>;
-        // } | null = null;
-
         const onStatus = async (data: unknown) => {
           const { loaded, total } = data as { loaded: number; total: number };
           if (loaded !== undefined && onProgress) {
@@ -154,47 +140,12 @@ export class SplatLoader extends Loader {
             }
             worker.call("nextChunk", { chunk });
           }
-
-          // if ((data as { orig?: unknown }).orig) {
-          //   if (extSplats) {
-          //     initExt = (data as { orig?: unknown }).orig as {
-          //       numSplats: number;
-          //       ext0: Uint32Array;
-          //       ext1: Uint32Array;
-          //       extra: Record<string, unknown>;
-          //     };
-          //     extSplats.initialize({
-          //       numSplats: initExt?.numSplats,
-          //       extArrays: [initExt?.ext0, initExt?.ext1],
-          //       extra: initExt?.extra,
-          //     });
-          //     calledOnLoad = true;
-          //     onLoad?.(extSplats);
-          //   } else if (packedSplats) {
-          //     init = (data as { orig?: unknown }).orig as {
-          //       numSplats: number;
-          //       packedArray: Uint32Array;
-          //       extra: Record<string, unknown>;
-          //       splatEncoding: SplatEncoding;
-          //     };
-          //     packedSplats.initialize({
-          //       numSplats: init?.numSplats,
-          //       packedArray: init?.packedArray,
-          //       extra: init?.extra,
-          //       splatEncoding: init?.splatEncoding,
-          //     });
-          //     calledOnLoad = true;
-          //     onLoad?.(packedSplats);
-          //   } else {
-          //     console.warn("No splats to initialize");
-          //   }
-          // }
         };
 
         const basedUrl = resolvedURL
           ? new URL(resolvedURL, window.location.href).toString()
           : undefined;
-        const decoded = (await worker.call(
+        const decoded = await worker.call(
           extSplats ? "loadExtSplats" : "loadPackedSplats",
           {
             url: basedUrl,
@@ -212,73 +163,36 @@ export class SplatLoader extends Loader {
             lodAbove,
           },
           { onStatus },
-        )) as {
-          numSplats: number;
-          packedArray?: Uint32Array;
-          ext0?: Uint32Array;
-          ext1?: Uint32Array;
-          extra: Record<string, unknown>;
-          splatEncoding?: SplatEncoding;
-          lodSplats?:
-            | {
-                numSplats: number;
-                packedArray?: Uint32Array;
-                ext0?: Uint32Array;
-                ext1?: Uint32Array;
-                extra: Record<string, unknown>;
-                splatEncoding?: SplatEncoding;
-              }
-            | PackedSplats
-            | ExtSplats;
-        };
+        );
 
-        if (decoded.lodSplats) {
+        // NOTE: Make use of the fact that ExtResult and PackedResult are compatible
+        //       with the ExtSplatsOptions and PackedSplatsOptions types.
+        const options = decoded as ExtSplatsOptions | PackedSplatsOptions;
+
+        // Convert the lodSplats from the Ext/PackedResult
+        // into actual ExtSplats or PackedSplats if present
+        if ("lodSplats" in decoded) {
           if (extSplats) {
-            decoded.lodSplats = new ExtSplats({
-              ...(decoded.lodSplats as {
-                numSplats: number;
-                extArrays: [Uint32Array, Uint32Array];
-                extra: Record<string, unknown>;
-              }),
+            options.lodSplats = new ExtSplats({
+              ...(decoded.lodSplats as ExtResult),
             });
           } else {
-            decoded.lodSplats = new PackedSplats({
-              ...(decoded.lodSplats as {
-                numSplats: number;
-                packedArray: Uint32Array;
-                extra: Record<string, unknown>;
-                splatEncoding: SplatEncoding;
-              }),
+            options.lodSplats = new PackedSplats({
+              ...(decoded.lodSplats as PackedResult),
               maxSplats: packedSplats?.maxSplats,
             });
           }
         }
 
+        let resultSplats: ExtSplats | PackedSplats;
         if (extSplats) {
-          const initExtSplats = {
-            // ...(initExt ?? {}),
-            ...decoded,
-          };
-          extSplats.initialize(initExtSplats as ExtSplatsOptions);
-          // if (!calledOnLoad) {
-          onLoad?.(extSplats);
-          // }
+          resultSplats = extSplats;
+          extSplats.initialize(options as ExtSplatsOptions);
         } else {
-          const initSplats = {
-            // ...(init ?? {}),
-            ...decoded,
-          };
-          if (packedSplats) {
-            packedSplats.initialize(initSplats as PackedSplatsOptions);
-            // if (!calledOnLoad) {
-            onLoad?.(packedSplats);
-            // }
-          } else {
-            // if (!calledOnLoad) {
-            onLoad?.(new PackedSplats(initSplats as PackedSplatsOptions));
-            // }
-          }
+          resultSplats = packedSplats ?? new PackedSplats();
+          resultSplats.initialize(options as PackedSplatsOptions);
         }
+        onLoad?.(resultSplats);
       })
       .catch((error) => {
         this.manager.itemError(resolvedURL ?? "");
@@ -338,65 +252,6 @@ export class SplatLoader extends Loader {
       });
     });
   }
-}
-
-async function fetchWithProgress(
-  request: Request,
-  onProgress?: (event: ProgressEvent) => void,
-) {
-  const response = await fetch(request);
-  if (!response.ok) {
-    throw new Error(
-      `${response.status} "${response.statusText}" fetching URL: ${request.url}`,
-    );
-  }
-  if (!response.body) {
-    throw new Error(`Response body is null for URL: ${request.url}`);
-  }
-
-  const reader = response.body.getReader();
-  let loaded = 0;
-  const chunks: Uint8Array[] = [];
-  try {
-    const contentLength = Number.parseInt(
-      response.headers.get("Content-Length") || "0",
-    );
-    const total = Number.isNaN(contentLength) ? 0 : contentLength;
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-      chunks.push(value);
-      loaded += value.length;
-
-      if (onProgress) {
-        onProgress(
-          new ProgressEvent("progress", {
-            lengthComputable: total !== 0,
-            loaded,
-            total,
-          }),
-        );
-      }
-    }
-  } catch (err) {
-    try {
-      const reason = err instanceof Error ? err.message : "Unknown error";
-      await reader.cancel(reason);
-    } catch {}
-    throw err;
-  }
-
-  // Combine chunks into a single buffer
-  const bytes = new Uint8Array(loaded);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return bytes.buffer;
 }
 
 export function getSplatFileType(
@@ -769,18 +624,3 @@ export class SplatData {
     }
   }
 }
-
-export type FileInput = {
-  fileBytes: Uint8Array;
-  fileType?: SplatFileType;
-  pathOrUrl?: string;
-  transform?: { translate?: number[]; quaternion?: number[]; scale?: number };
-};
-
-export type TranscodeSpzInput = {
-  inputs: FileInput[];
-  maxSh?: number;
-  clipXyz?: { min: number[]; max: number[] };
-  fractionalBits?: number;
-  opacityThreshold?: number;
-};
