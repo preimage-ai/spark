@@ -12,3 +12,4 @@ test/browser/fixtures/
 test-results/
 playwright-report/
 dist/
+dist
