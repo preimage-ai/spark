@@ -26,7 +26,9 @@ flat out float adjustedStdDev;
 // these carry the data it needs to reconstruct that ray.
 flat out mat3 vInvRS;            // (R*S)^-1 = S^-1 * R^T  (view -> splat space)
 flat out vec3 vMu;               // view-space centre μ
-flat out vec2 vInvFocal;         // (1/px, 1/py) from the projection matrix
+// (1/P[0][0], 1/P[1][1], P[2][0], P[2][1]): focal reciprocals plus the
+// principal-point offset, non-zero for an off-centre frustum (setViewOffset).
+flat out vec4 vRayProj;
 flat out vec2 vScaledRenderSize; // the scaledRenderSize used for bounds here
 /**
  * 1.0 when the 3D ray evaluation above is valid for this splat, 0.0 when the
@@ -63,6 +65,8 @@ uniform float focalDistance;
 uniform float apertureAngle;
 uniform float clipXY;
 uniform float focalAdjustment;
+/** false = stock Spark (Jacobian + 2D footprint) for A/B against 3DGUT. */
+uniform bool enable3DGUT;
 
 uniform usampler2D ordering;
 uniform usampler2DArray extSplats;
@@ -217,7 +221,7 @@ void main() {
     // principal axes to place sigma points on. `scales` is final here (the
     // lodInflate rescale above already applied), so the points match the
     // geometry that actually gets drawn.
-    bool useUT = !enableCovSplats;
+    bool useUT = enable3DGUT && !enableCovSplats;
     vec4 clipSigmaPts[6];
     if (useUT) {
         vec3 sigmaPts[6];
@@ -301,10 +305,13 @@ void main() {
         vInvRS = Sinv * transpose(R);
         vMu = viewCenter;
         vScaledRenderSize = scaledRenderSize;
-        vInvFocal = vec2(1.0 / projectionMatrix[0][0], 1.0 / projectionMatrix[1][1]);
+        vRayProj = vec4(
+            1.0 / projectionMatrix[0][0], 1.0 / projectionMatrix[1][1],
+            projectionMatrix[2][0], projectionMatrix[2][1]
+        );
         // An orthographic camera has no single ray origin, so the view-space
         // ray reconstruction in the fragment stage does not apply.
-        vSplat3D = isOrthographic ? 0.0 : 1.0;
+        vSplat3D = (enable3DGUT && !isOrthographic) ? 1.0 : 0.0;
     } else {
         cov3D = mat3(
             xxyyzz.x, xyxzyz.x, xyxzyz.y,
@@ -397,8 +404,13 @@ void main() {
     float det = a * d - b * b;
 
     // Compute anti-aliasing intensity scaling factor
-    float blurAdjust = sqrt(max(0.0, detOrig / det));
-    rgba.a *= blurAdjust;
+    // Skipped under 3DGUT: the blur only widens the rasterised quad there, the
+    // fragment response comes from the un-blurred 3D Gaussian, so compensating
+    // for it just dims small and thin splats.
+    if (vSplat3D < 0.5) {
+        float blurAdjust = sqrt(max(0.0, detOrig / det));
+        rgba.a *= blurAdjust;
+    }
     if (rgba.a < minAlpha) {
         return;
     }

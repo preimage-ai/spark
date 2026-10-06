@@ -25,7 +25,7 @@ flat in float adjustedStdDev;
 // ---- 3DGUT per-pixel 3D evaluation (see splatVertex.glsl) ----
 flat in mat3 vInvRS;             // (R*S)^-1 = S^-1 * R^T  (view -> splat space)
 flat in vec3 vMu;                // view-space centre μ
-flat in vec2 vInvFocal;          // (1/px, 1/py)
+flat in vec4 vRayProj;           // (1/P00, 1/P11, P20, P21)
 flat in vec2 vScaledRenderSize;  // framebuffer size used in the vertex stage
 flat in float vSplat3D;          // 1.0 = 3D ray test valid, 0.0 = 2D fallback
 
@@ -56,9 +56,15 @@ void main() {
             (gl_FragCoord.x / vScaledRenderSize.x) * 2.0 - 1.0,
             (gl_FragCoord.y / vScaledRenderSize.y) * 2.0 - 1.0
         );
-        // Camera at the origin looking down -Z; no skew, so the direction
-        // through this pixel is (x/px, y/py, -1).
-        vec3 dView = normalize(vec3(ndc.x * vInvFocal.x, ndc.y * vInvFocal.y, -1.0));
+        // Camera at the origin looking down -Z. Inverting
+        // ndc = P00 * x/(-z) - P20 gives x/(-z) = (ndc + P20) / P00; the P20/P21
+        // terms are zero for a centred frustum but not after setViewOffset
+        // (compare-mode panes), where dropping them shifts every ray.
+        vec3 dView = normalize(vec3(
+            (ndc.x + vRayProj.z) * vRayProj.x,
+            (ndc.y + vRayProj.w) * vRayProj.y,
+            -1.0
+        ));
 
         // ---- Map the ray into SPLAT space, where the Gaussian is N(0, I) ----
         // r(t) = o + t*d with o = 0. Solving RS*u + μ = o + t*d gives
