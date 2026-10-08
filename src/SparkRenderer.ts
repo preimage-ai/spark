@@ -150,6 +150,13 @@ export interface SparkRendererOptions {
    */
   focalAdjustment?: number;
   /**
+   * Render with 3DGUT: 2D footprint estimated by the unscented transform and
+   * each pixel evaluated against the 3D Gaussian along its view ray. false
+   * falls back to stock Spark (EWA Jacobian + screen-space Gaussian), for A/B.
+   * @default true
+   */
+  enable3DGUT?: boolean;
+  /**
    * Whether to sort splats radially (geometric distance) from the viewpoint (true)
    * or by Z-depth (false). Most scenes are trained with the Z-depth `sort `metric
    * and will render more accurately at certain viewpoints. However, radial sorting
@@ -356,6 +363,7 @@ export class SparkRenderer extends THREE.Mesh {
   falloff: number;
   clipXY: number;
   focalAdjustment: number;
+  enable3DGUT: boolean;
 
   sortRadial: boolean;
   minSortIntervalMs: number;
@@ -533,6 +541,7 @@ export class SparkRenderer extends THREE.Mesh {
     this.falloff = options.falloff ?? 1.0;
     this.clipXY = options.clipXY ?? 1.4;
     this.focalAdjustment = options.focalAdjustment ?? 1.0;
+    this.enable3DGUT = options.enable3DGUT ?? true;
 
     this.sortRadial = options.sortRadial ?? true;
     this.minSortIntervalMs = options.minSortIntervalMs ?? 0;
@@ -668,6 +677,8 @@ export class SparkRenderer extends THREE.Mesh {
       clipXY: { value: 1.4 },
       // Debug renderSize scale factor
       focalAdjustment: { value: 1.0 },
+      // 3DGUT rendering vs stock Spark (see SparkRendererOptions.enable3DGUT)
+      enable3DGUT: { value: true },
       // Whether to encode Gsplat with linear RGB (for environment mapping)
       encodeLinear: { value: false },
       // Back-to-front sort ordering of splat indices
@@ -855,6 +866,7 @@ export class SparkRenderer extends THREE.Mesh {
     this.uniforms.falloff.value = spark.falloff;
     this.uniforms.clipXY.value = spark.clipXY;
     this.uniforms.focalAdjustment.value = spark.focalAdjustment;
+    this.uniforms.enable3DGUT.value = spark.enable3DGUT;
 
     const outputColorSpace =
       currentRenderTarget === null
