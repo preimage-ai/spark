@@ -22,24 +22,25 @@ flat out float adjustedStdDev;
 // splats far off the optical axis.
 //
 // The fragment stage additionally evaluates each splat against the real
-// per-pixel ray in 3D rather than against a flat screen-space footprint, so
-// these carry the data it needs to reconstruct that ray.
-flat out mat3 vInvRS;            // (R*S)^-1 = S^-1 * R^T  (view -> splat space)
-flat out vec3 vMu;               // view-space centre μ
-// (1/P[0][0], 1/P[1][1], P[2][0], P[2][1]): focal reciprocals plus the
-// principal-point offset, non-zero for an off-centre frustum (setViewOffset).
-flat out vec4 vRayProj;
-flat out vec2 vScaledRenderSize; // the scaledRenderSize used for bounds here
+// per-pixel ray in 3D rather than against a flat screen-space footprint. The
+// ray is handed over already in SPLAT space (where the Gaussian is N(0, I)):
+//   u(t) = A + t·B,  A = (RS)⁻¹(o − μ) (o = 0),  B = (RS)⁻¹·d
+// A is constant per splat; B is linear in the (unnormalised) view direction
+// d = ((ndc.x + P20)/P00, (ndc.y + P21)/P11, −1), which is affine in NDC.
+// Every corner of the quad shares the centre's clip w, so interpolation is
+// plain linear in screen space — B computed per CORNER and interpolated is
+// exactly B per pixel. The fragment stage is left with a few dot products,
+// and two varyings replace the old matrix + centre + projection set.
+flat out vec3 vRayA;
+out vec3 vRayB;
 /**
  * 1.0 when the 3D ray evaluation above is valid for this splat, 0.0 when the
  * fragment stage must fall back to the classic 2D screen-space Gaussian.
  *
- * Needed because two splat kinds have no (R,S) decomposition to invert:
- *  - COVARIANCE splats (`enableCovSplats`), which arrive as a raw 3x3
- *    covariance with no scales/quaternion;
- *  - 2DGS discs (`enable2DGS` with a zero scale axis), which are flat and
- *    whose RS is singular by construction.
- * Both keep upstream's Jacobian/screen-space path untouched.
+ * 0.0 for splat kinds with no (R,S) decomposition to invert — COVARIANCE
+ * splats (`enableCovSplats`) and 2DGS discs (singular RS) — for orthographic
+ * cameras (no single ray origin), and for splats smaller on screen than
+ * UT_MIN_PIXEL_STDDEV, where 3DGUT and the Jacobian render identically.
  */
 flat out float vSplat3D;
 
@@ -94,6 +95,15 @@ const float UT_CENTER_WEIGHT = UT_LAMBDA / (3.0 + UT_LAMBDA);
 const float UT_CENTER_WEIGHT_COV =
     UT_CENTER_WEIGHT + 1.0 - UT_SPREAD * UT_SPREAD + UT_BETA;
 const float UT_SIGMA_WEIGHT = 1.0 / (2.0 * (3.0 + UT_LAMBDA));
+/**
+ * Below this on-screen std dev (px, from the cheap Jacobian estimate) a
+ * splat takes the classic path. The projection is near-linear across a few
+ * pixels, so 3DGUT changes nothing visible there — while its sigma-point
+ * projection (run per quad CORNER) and per-pixel ray test dominated the cost
+ * of large scenes (Ultra, 3.75M splats: 47 → 29 fps with it on everywhere).
+ */
+const float UT_MIN_PIXEL_STDDEV = 2.0;
+
 
 /**
  * The 6 sigma points of a 3D Gaussian: the centre offset along each principal
@@ -118,6 +128,16 @@ void computeSplatSigmaPoints(
     sigmaPts[3] = center - axes[1] * offsets.y;
     sigmaPts[4] = center + axes[2] * offsets.z;
     sigmaPts[5] = center - axes[2] * offsets.z;
+}
+
+/** The 6 sigma points of a splat, projected to clip space. */
+void projectSigmaPoints(vec3 center, vec3 scales, vec4 quaternion, out vec4 clipPts[6]) {
+    vec3 sigmaPts[6];
+    computeSplatSigmaPoints(center, scales, quaternion, UT_MULTIPLIER, sigmaPts);
+    for (int i = 0; i < 6; ++i) {
+        vec3 viewPt = quatVec(renderToViewQuat, sigmaPts[i]) + renderToViewPos;
+        clipPts[i] = projectionMatrix * vec4(viewPt, 1.0);
+    }
 }
 
 void main() {
@@ -217,31 +237,23 @@ void main() {
         return;
     }
 
-    // 3DGUT applies to the (R,S) splat kinds only — a covariance splat has no
-    // principal axes to place sigma points on. `scales` is final here (the
-    // lodInflate rescale above already applied), so the points match the
-    // geometry that actually gets drawn.
-    bool useUT = enable3DGUT && !enableCovSplats;
+    // 3DGUT applies to the (R,S) splat kinds under a perspective camera only
+    // (see vSplat3D). `scales` is final here (the lodInflate rescale above
+    // already applied), so sigma points match the geometry actually drawn.
+    bool utEligible = enable3DGUT && !enableCovSplats && !isOrthographic;
     vec4 clipSigmaPts[6];
-    if (useUT) {
-        vec3 sigmaPts[6];
-        computeSplatSigmaPoints(center, scales, quaternion, UT_MULTIPLIER, sigmaPts);
-        for (int i = 0; i < 6; ++i) {
-            vec3 viewSigmaPt = quatVec(renderToViewQuat, sigmaPts[i]) + renderToViewPos;
-            clipSigmaPts[i] = projectionMatrix * vec4(viewSigmaPt, 1.0);
-        }
-    }
+    bool haveSigmaPts = false;
 
-    // Discard splats more than clipXY times outside the XY frustum.
-    //
-    // 3DGUT widens this from a centre-only test: a splat whose centre is off
-    // screen can still have sigma points on screen (large, or near the
-    // frustum edge under a wide FOV), and culling it on the centre alone pops
-    // it out of frame. Kept as an early-accept so the common on-screen case
-    // costs exactly one comparison, as before.
+    // Discard splats more than clipXY times outside the XY frustum. 3DGUT
+    // widens this from a centre-only test: a splat whose centre is off screen
+    // can still have sigma points on screen (large, or near the frustum edge
+    // under a wide FOV). The centre test is the early accept, so the sigma
+    // points are only projected here for the few splats that fail it.
     float clip = clipXY * clipCenter.w;
     bool anyInside = (abs(clipCenter.x) <= clip) && (abs(clipCenter.y) <= clip);
-    if (!anyInside && useUT) {
+    if (!anyInside && utEligible) {
+        projectSigmaPoints(center, scales, quaternion, clipSigmaPts);
+        haveSigmaPts = true;
         for (int i = 0; i < 6; ++i) {
             float clipSigma = clipXY * clipSigmaPts[i].w;
             if (abs(clipSigmaPts[i].x) <= clipSigma &&
@@ -262,6 +274,7 @@ void main() {
     vSplatIndex = splatIndex;
 
     vec2 scaledRenderSize = renderSize * focalAdjustment;
+    mat3 invRS = mat3(1.0);
 
     if (!enableCovSplats) {
         // Compute view space quaternion of splat
@@ -289,29 +302,21 @@ void main() {
         mat3 RS = scaleQuaternionToMatrix(scales, viewQuaternion);
         cov3D = RS * transpose(RS);
 
-        // ---- 3DGUT: data for the fragment stage's per-pixel ray test ----
-        // (R*S)^-1 = S^-1 * R^T, built without a general matrix inverse.
-        mat3 R = scaleQuaternionToMatrix(vec3(1.0), viewQuaternion);
-        vec3 sInv = vec3(
-            (scales.x > 0.0) ? 1.0 / scales.x : 0.0,
-            (scales.y > 0.0) ? 1.0 / scales.y : 0.0,
-            (scales.z > 0.0) ? 1.0 / scales.z : 0.0
-        );
-        mat3 Sinv = mat3(
-            sInv.x, 0.0, 0.0,
-            0.0, sInv.y, 0.0,
-            0.0, 0.0, sInv.z
-        );
-        vInvRS = Sinv * transpose(R);
-        vMu = viewCenter;
-        vScaledRenderSize = scaledRenderSize;
-        vRayProj = vec4(
-            1.0 / projectionMatrix[0][0], 1.0 / projectionMatrix[1][1],
-            projectionMatrix[2][0], projectionMatrix[2][1]
-        );
-        // An orthographic camera has no single ray origin, so the view-space
-        // ray reconstruction in the fragment stage does not apply.
-        vSplat3D = (enable3DGUT && !isOrthographic) ? 1.0 : 0.0;
+        if (utEligible) {
+            // (R*S)^-1 = S^-1 * R^T, built without a general matrix inverse —
+            // only needed if this splat ends up on the 3D path (below).
+            mat3 R = scaleQuaternionToMatrix(vec3(1.0), viewQuaternion);
+            vec3 sInv = vec3(
+                (scales.x > 0.0) ? 1.0 / scales.x : 0.0,
+                (scales.y > 0.0) ? 1.0 / scales.y : 0.0,
+                (scales.z > 0.0) ? 1.0 / scales.z : 0.0
+            );
+            invRS = mat3(
+                sInv.x, 0.0, 0.0,
+                0.0, sInv.y, 0.0,
+                0.0, 0.0, sInv.z
+            ) * transpose(R);
+        }
     } else {
         cov3D = mat3(
             xxyyzz.x, xyxzyz.x, xyxzyz.y,
@@ -321,14 +326,47 @@ void main() {
         cov3D = renderToViewBasis * cov3D * transpose(renderToViewBasis);
     }
 
-    // Compute the Jacobian of the splat's projection at its center
+    // Compute the Jacobian of the splat's projection at its center — always:
+    // it is the classic estimate AND the cheap size test gating 3DGUT.
     vec2 focal = 0.5 * scaledRenderSize * vec2(projectionMatrix[0][0], projectionMatrix[1][1]);
 
-    float a, b, d;
+    mat3 J;
+    if (isOrthographic) {
+        J = mat3(
+            focal.x, 0.0, 0.0,
+            0.0, focal.y, 0.0,
+            0.0, 0.0, 0.0
+        );
+    } else {
+        float invZ = 1.0 / viewCenter.z;
+        vec2 J1 = focal * invZ;
+        vec2 J2 = -(J1 * viewCenter.xy) * invZ;
+        J = mat3(
+            J1.x, 0.0, J2.x,
+            0.0, J1.y, J2.y,
+            0.0, 0.0, 0.0
+        );
+    }
+
+    // Compute the 2D covariance by projecting the 3D covariance
+    // and picking out the XY plane components.
+    mat3 cov2D = transpose(J) * cov3D * J;
+    float a = cov2D[0][0];
+    float d = cov2D[1][1];
+    float b = cov2D[0][1];
+
+    // Size gate: largest eigenvalue of the Jacobian estimate, px².
+    float jacMaxVar = 0.5 * (a + d) + sqrt(max(0.0, 0.25 * sqr(a - d) + b * b));
+    bool useUT = utEligible && jacMaxVar >= sqr(UT_MIN_PIXEL_STDDEV);
+    vSplat3D = useUT ? 1.0 : 0.0;
+
     if (useUT) {
         // ---- 3DGUT: estimate the 2D covariance from the sigma points ----
         // Weighted mean and covariance of the projected points in NDC, then
         // scaled into pixel units (the frame the blur/AA math below works in).
+        if (!haveSigmaPts) {
+            projectSigmaPoints(center, scales, quaternion, clipSigmaPts);
+        }
         vec3 ndcCenterUT = clipCenter.xyz / clipCenter.w;
         vec2 ndcSigmaPts[6];
         vec2 ndcMean = ndcCenterUT.xy * UT_CENTER_WEIGHT;
@@ -355,31 +393,6 @@ void main() {
         a = cov2DPixels[0][0];
         d = cov2DPixels[1][1];
         b = cov2DPixels[0][1];
-    } else {
-        mat3 J;
-        if (isOrthographic) {
-            J = mat3(
-                focal.x, 0.0, 0.0,
-                0.0, focal.y, 0.0,
-                0.0, 0.0, 0.0
-            );
-        } else {
-            float invZ = 1.0 / viewCenter.z;
-            vec2 J1 = focal * invZ;
-            vec2 J2 = -(J1 * viewCenter.xy) * invZ;
-            J = mat3(
-                J1.x, 0.0, J2.x,
-                0.0, J1.y, J2.y,
-                0.0, 0.0, 0.0
-            );
-        }
-
-        // Compute the 2D covariance by projecting the 3D covariance
-        // and picking out the XY plane components.
-        mat3 cov2D = transpose(J) * cov3D * J;
-        a = cov2D[0][0];
-        d = cov2D[1][1];
-        b = cov2D[0][1];
     }
 
     // Optionally pre-blur the splat to match non-antialias optimized splats
@@ -442,6 +455,19 @@ void main() {
 
     vNdc = ndc;
     gl_Position = vec4(ndc.xy * clipCenter.w, clipCenter.zw);
+
+    if (useUT) {
+        // Splat-space ray for this corner (see vRayA / vRayB). The P20/P21
+        // terms are zero for a centred frustum but not after setViewOffset
+        // (compare-mode panes), where dropping them shifts every ray.
+        vec3 dView = vec3(
+            (ndc.x + projectionMatrix[2][0]) / projectionMatrix[0][0],
+            (ndc.y + projectionMatrix[2][1]) / projectionMatrix[1][1],
+            -1.0
+        );
+        vRayA = -(invRS * viewCenter);
+        vRayB = invRS * dView;
+    }
 
     #include <logdepthbuf_vertex>
 }

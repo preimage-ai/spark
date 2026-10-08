@@ -23,10 +23,9 @@ flat in uint vSplatIndex;
 flat in float adjustedStdDev;
 
 // ---- 3DGUT per-pixel 3D evaluation (see splatVertex.glsl) ----
-flat in mat3 vInvRS;             // (R*S)^-1 = S^-1 * R^T  (view -> splat space)
-flat in vec3 vMu;                // view-space centre μ
-flat in vec4 vRayProj;           // (1/P00, 1/P11, P20, P21)
-flat in vec2 vScaledRenderSize;  // framebuffer size used in the vertex stage
+// The pixel's ray in SPLAT space, u(t) = A + t·B (Gaussian = N(0, I) there).
+flat in vec3 vRayA;              // constant per splat
+in vec3 vRayB;                   // interpolated per pixel (exact — see vertex)
 flat in float vSplat3D;          // 1.0 = 3D ray test valid, 0.0 = 2D fallback
 
 #include <logdepthbuf_pars_fragment>
@@ -50,39 +49,19 @@ void main() {
     float response;
 
     if (vSplat3D > 0.5) {
-        // ---- Per-pixel ray in VIEW space (perspective) ----
-        // Pixel centre in NDC [-1,1].
-        vec2 ndc = vec2(
-            (gl_FragCoord.x / vScaledRenderSize.x) * 2.0 - 1.0,
-            (gl_FragCoord.y / vScaledRenderSize.y) * 2.0 - 1.0
-        );
-        // Camera at the origin looking down -Z. Inverting
-        // ndc = P00 * x/(-z) - P20 gives x/(-z) = (ndc + P20) / P00; the P20/P21
-        // terms are zero for a centred frustum but not after setViewOffset
-        // (compare-mode panes), where dropping them shifts every ray.
-        vec3 dView = normalize(vec3(
-            (ndc.x + vRayProj.z) * vRayProj.x,
-            (ndc.y + vRayProj.w) * vRayProj.y,
-            -1.0
-        ));
-
-        // ---- Map the ray into SPLAT space, where the Gaussian is N(0, I) ----
-        // r(t) = o + t*d with o = 0. Solving RS*u + μ = o + t*d gives
-        // u(t) = RS^-1 (o - μ) + t * RS^-1 d.
-        vec3 A = -(vInvRS * vMu);
-        vec3 B = vInvRS * dView;
-
-        // Closest approach of the ray to the centre, in splat space.
+        // Closest approach of the pixel's ray to the centre, in splat space:
+        // |A + t*B|² is minimised at t* = −(A·B)/(B·B), leaving
+        // ρ² = |A|² − (A·B)²/|B|² (the Mahalanobis distance² there). Scale-
+        // free in B, so the interpolated, unnormalised direction is fine.
+        vec3 A = vRayA;
+        vec3 B = vRayB;
         float BB = dot(B, B);
         if (BB < 1e-20) {
             // Degenerate / near-parallel: nothing meaningful to integrate.
             discard;
         }
-        float tStar = -dot(B, A) / BB;
-        vec3 uStar = A + tStar * B;
-
-        // Mahalanobis distance² (covariance is identity in this space).
-        float rho2 = dot(uStar, uStar);
+        float BA = dot(B, A);
+        float rho2 = max(0.0, dot(A, A) - BA * BA / BB);
         response = exp(-0.5 * rho2);
 
         // Fade to zero at the edge of the rasterised footprint. The 3D
