@@ -1,6 +1,6 @@
 {
   "name": "@preimage/gaussian-splat-viewer-v2",
-  "version": "2.4.1",
+  "version": "2.4.2",
   "description": "An advanced 3D Gaussian Splatting renderer for THREE.js",
   "homepage": "https://sparkjs.dev/",
   "type": "module",
