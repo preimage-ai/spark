@@ -228,6 +228,21 @@ pub struct GsplatArray {
     pub sh1: Vec<GsplatSH1>,
     pub sh2: Vec<GsplatSH2>,
     pub sh3: Vec<GsplatSH3>,
+    /// Clustered-SH codebooks, flat, 9/15/21 f32 per cluster entry.
+    ///
+    /// A RAD written with `--cluster-sh` stores SH once per cluster in
+    /// `sh1_code`/`sh2_code`/`sh3_code` (chunk 0) and gives each splat a
+    /// `sh_label` index into them. These hold that codebook during decode;
+    /// `set_sh_labels` resolves each label and materialises the per-splat
+    /// values into `sh1`/`sh2`/`sh3` above.
+    ///
+    /// Decode-time staging only: once the labels of a chunk are resolved the
+    /// per-splat SH is authoritative, so the clone/permute helpers below
+    /// deliberately do not carry these over (every one of them runs after
+    /// decoding, during LOD construction).
+    pub sh1_codes: Vec<f32>,
+    pub sh2_codes: Vec<f32>,
+    pub sh3_codes: Vec<f32>,
 }
 
 impl TsplatArray for GsplatArray {
@@ -243,6 +258,9 @@ impl TsplatArray for GsplatArray {
             sh1: Vec::with_capacity(if max_sh_degree >= 1 { capacity } else { 0 }),
             sh2: Vec::with_capacity(if max_sh_degree >= 2 { capacity } else { 0 }),
             sh3: Vec::with_capacity(if max_sh_degree >= 3 { capacity } else { 0 }),
+            sh1_codes: Vec::new(),
+            sh2_codes: Vec::new(),
+            sh3_codes: Vec::new(),
         }
     }
 
@@ -590,6 +608,10 @@ impl TsplatArray for GsplatArray {
             } else {
                 Vec::new()
             },
+            // Decode-time staging; see the field docs.
+            sh1_codes: Vec::new(),
+            sh2_codes: Vec::new(),
+            sh3_codes: Vec::new(),
         }
     }
 
@@ -601,6 +623,10 @@ impl TsplatArray for GsplatArray {
             sh1: if self.sh1.is_empty() { Vec::new() } else { self.sh1[start..start + count].to_vec() },
             sh2: if self.sh2.is_empty() { Vec::new() } else { self.sh2[start..start + count].to_vec() },
             sh3: if self.sh3.is_empty() { Vec::new() } else { self.sh3[start..start + count].to_vec() },
+            // Decode-time staging; see the field docs.
+            sh1_codes: Vec::new(),
+            sh2_codes: Vec::new(),
+            sh3_codes: Vec::new(),
         }
     }
 }
@@ -713,6 +739,19 @@ pub fn ellipsoid_area(scales: Vec3A) -> f32 {
     const P: f32 = 1.6075;
     let numerator = (scales.x * scales.y).powf(P) + (scales.x * scales.z).powf(P) + (scales.y * scales.z).powf(P);
     4.0 * std::f32::consts::PI * (numerator / 3.0).powf(1.0 / P)
+}
+
+/// Stage a slice of an SH codebook, growing the buffer to fit.
+///
+/// `base`/`count` index CLUSTER entries, not splats (the encoder emits the
+/// codebook as a single `0..num_clusters` range), and `dims` is the number of
+/// f32 per entry for that degree band: 9, 15 or 21.
+fn store_sh_codes(dst: &mut Vec<f32>, base: usize, count: usize, dims: usize, src: &[f32]) {
+    let end = (base + count) * dims;
+    if dst.len() < end {
+        dst.resize(end, 0.0);
+    }
+    dst[base * dims..end].copy_from_slice(&src[..count * dims]);
 }
 
 impl SplatReceiver for GsplatArray {
@@ -856,6 +895,68 @@ impl SplatReceiver for GsplatArray {
             for i in 0..count {
                 let i21 = i * 21;
                 self.sh3[base + i].set_from_array(&sh3[i21..i21 + 21]);
+            }
+        }
+    }
+
+    // --- Clustered SH (`--cluster-sh` RAD input) -----------------------------
+    //
+    // These four were empty default methods on SplatReceiver, which silently
+    // discarded the SH of any RAD written with `--cluster-sh`: the decoder
+    // parsed the codebook and the labels, handed them over, and nothing stored
+    // them. The file still declared `maxSh: 3`, so re-encoding produced an
+    // asset with full-size, all-zero SH — same memory cost, no view-dependent
+    // colour, and no error anywhere. `build-lod --unlod` on a clustered RAD was
+    // therefore lossy. spark-rs implements these for its own PackedSplats and
+    // ExtSplats (that is why the browser reads such files correctly); only the
+    // native array used by build-lod was missing them.
+
+    fn set_sh1_codes(&mut self, base: usize, count: usize, sh1_codes: &[f32]) {
+        store_sh_codes(&mut self.sh1_codes, base, count, 9, sh1_codes);
+    }
+
+    fn set_sh2_codes(&mut self, base: usize, count: usize, sh2_codes: &[f32]) {
+        store_sh_codes(&mut self.sh2_codes, base, count, 15, sh2_codes);
+    }
+
+    fn set_sh3_codes(&mut self, base: usize, count: usize, sh3_codes: &[f32]) {
+        store_sh_codes(&mut self.sh3_codes, base, count, 21, sh3_codes);
+    }
+
+    /// Resolve one chunk's cluster labels into per-splat SH.
+    ///
+    /// Safe to call when no codebook was supplied (a non-clustered file never
+    /// emits `sh_label` at all) and when a degree's codebook is absent because
+    /// `clamp_sh_degree` already dropped it — each band is guarded separately.
+    fn set_sh_labels(&mut self, base: usize, count: usize, sh_labels: &[u32]) {
+        if self.max_sh_degree == 0 {
+            return;
+        }
+        if self.max_sh_degree >= 1 && !self.sh1_codes.is_empty() {
+            let (out, codes) = (&mut self.sh1, &self.sh1_codes);
+            for (i, &label) in sh_labels[..count].iter().enumerate() {
+                let o = label as usize * 9;
+                if let Some(v) = codes.get(o..o + 9) {
+                    out[base + i].set_from_array(v);
+                }
+            }
+        }
+        if self.max_sh_degree >= 2 && !self.sh2_codes.is_empty() {
+            let (out, codes) = (&mut self.sh2, &self.sh2_codes);
+            for (i, &label) in sh_labels[..count].iter().enumerate() {
+                let o = label as usize * 15;
+                if let Some(v) = codes.get(o..o + 15) {
+                    out[base + i].set_from_array(v);
+                }
+            }
+        }
+        if self.max_sh_degree >= 3 && !self.sh3_codes.is_empty() {
+            let (out, codes) = (&mut self.sh3, &self.sh3_codes);
+            for (i, &label) in sh_labels[..count].iter().enumerate() {
+                let o = label as usize * 21;
+                if let Some(v) = codes.get(o..o + 21) {
+                    out[base + i].set_from_array(v);
+                }
             }
         }
     }
