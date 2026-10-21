@@ -66,7 +66,7 @@
     "test:rust": "cargo test --locked --manifest-path rust/Cargo.toml --workspace",
     "types": "tsc -p tsconfig.json --noEmit && tsc -p test/browser/tsconfig.json",
     "publish:ca": "./publish.sh",
-    "publish": "./publish.sh"
+    "release": "./publish.sh"
   },
   "repository": "sparkjsdev/spark",
   "files": [
