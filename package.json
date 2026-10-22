@@ -1,9 +1,28 @@
 {
-  "name": "@sparkjsdev/spark",
-  "version": "2.3.1",
+  "name": "@preimage/gaussian-splat-viewer-v2",
+  "version": "3.0.2",
   "description": "An advanced 3D Gaussian Splatting renderer for THREE.js",
   "homepage": "https://sparkjs.dev/",
   "type": "module",
+  "preimage": {
+    "sparkBase": "2.3.1",
+    "sparkUpstream": "https://github.com/sparkjsdev/spark",
+    "forkNotes": [
+      "This package's `version` is OUR OWN line and is unrelated to upstream Spark's.",
+      "They were the same field until 3.0.0, which collided: 2.4.0 / 2.4.1 / 2.4.2 were",
+      "published here off a Spark 2.3.1 base, so when upstream actually released 2.4.0",
+      "there was no version left to publish it as. Hence the jump to 3.0.0 and the split:",
+      "`version` = our artifact, `sparkBase` = the upstream tag we are rebased onto.",
+      "Keep `sparkBase` truthful - it is the only machine-readable record of what this is,",
+      "so update it in the SAME commit as any upstream rebase.",
+      "Local deltas on top of sparkBase: the 3DGUT projection port (splatVertex.glsl,",
+      "splatFragment.glsl) and clustered-SH read support in spark-lib (GsplatArray's",
+      "set_sh_labels / set_sh*_codes, which are empty stubs upstream through v2.4.0)."
+    ]
+  },
+  "publishConfig": {
+    "registry": "https://preimage-v2-847195926226.d.codeartifact.us-east-2.amazonaws.com/npm/preimage/"
+  },
   "main": "./dist/spark.cjs.js",
   "module": "./dist/spark.module.js",
   "types": "./dist/types/index.d.ts",
@@ -33,6 +52,7 @@
     "lint": "biome check .",
     "lint:fix": "biome check . --fix",
     "lint:summary": "biome check --reporter=summary",
+    "prepublishOnly": "npm run build:wasm && npm run build",
     "lint:rust": "cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings",
     "site:build:relativeurls": "npm run build && npm run site:clean && node scripts/copy-site-files.js && mkdocs build && node scripts/rename-assets-to-static.js && node scripts/replace-urls.js",
     "site:build": "npm run build && npm run site:clean && node scripts/copy-site-files.js && mkdocs build && node scripts/rename-assets-to-static.js",
@@ -44,10 +64,14 @@
     "test:browser": "playwright test -c test/browser/playwright.config.ts",
     "test:browser:update": "playwright test -c test/browser/playwright.config.ts --update-snapshots",
     "test:rust": "cargo test --locked --manifest-path rust/Cargo.toml --workspace",
-    "types": "tsc -p tsconfig.json --noEmit && tsc -p test/browser/tsconfig.json"
+    "types": "tsc -p tsconfig.json --noEmit && tsc -p test/browser/tsconfig.json",
+    "publish:ca": "./publish.sh",
+    "release": "./publish.sh"
   },
   "repository": "sparkjsdev/spark",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "license": "MIT",
   "devDependencies": {
     "@biomejs/biome": "1.9.4",
@@ -70,5 +94,12 @@
   "peerDependencies": {
     "three": ">=0.180.0"
   },
-  "keywords": ["3d", "three.js", "gsplats", "3dgs", "gaussian", "splats"]
+  "keywords": [
+    "3d",
+    "three.js",
+    "gsplats",
+    "3dgs",
+    "gaussian",
+    "splats"
+  ]
 }

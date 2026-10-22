@@ -1,0 +1,78 @@
+name: Build code and release it as a tarball
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Lets the build be exercised without cutting a tag first. The publish step
+  # is skipped unless the run was triggered by a tag.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      # The browser bundle embeds a WASM module built from rust/spark-rs:
+      # src/wasm.ts does `import WASM from "spark-rs/spark_rs_bg.wasm"`, where
+      # `spark-rs` resolves to rust/spark-rs/pkg (see vite.config.ts). That
+      # directory is build output and is gitignored (rust/.gitignore), so
+      # `npm run build` CANNOT resolve it on a fresh checkout — the Rust
+      # toolchain below and the build:wasm step are both required, not
+      # optional. Without them this job fails at the Vite resolve step.
+      - name: Setup Rust (wasm target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      # rust/build_rust_wasm.sh falls back to `cargo install wasm-pack`, which
+      # compiles it from source and costs several minutes on every run. The
+      # official installer drops in a prebuilt binary instead.
+      - name: Install wasm-pack
+        run: curl -sSfL https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+
+      - name: Install All Dependencies
+        run: npm ci
+
+      - name: Build WASM (rust/spark-rs -> rust/spark-rs/pkg)
+        run: npm run build:wasm
+
+      - name: Compile Spark Viewer
+        run: npm run build
+
+      - name: Package Release Tarball
+        run: |
+          TARBALL_NAME=$(npm pack)
+          echo "TARBALL_PATH=$TARBALL_NAME" >> $GITHUB_ENV
+
+      - name: Upload Tarball As Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spark-tarball
+          path: ${{ env.TARBALL_PATH }}
+
+      - name: Publish to Releases
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: ${{ env.TARBALL_PATH }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
