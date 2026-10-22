@@ -11,5 +11,9 @@ site-repo/
 test/browser/fixtures/
 test-results/
 playwright-report/
+# Upstream COMMITS its dist/ (it publishes straight from the repo and rewrites
+# the CDN URL each release). We build it at publish time instead, so tracking it
+# here only produced merge conflicts on every upstream sync — see the `dist/`
+# modify/delete conflicts when merging v2.4.0.
 dist/
-dist
+coverage/

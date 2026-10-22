@@ -1,7 +1,8 @@
 use std::any::Any;
+use std::io::{ErrorKind, Read};
 
 #[cfg(feature = "spz")]
-use miniz_oxide::inflate::{core::{decompress, inflate_flags::{TINFL_FLAG_HAS_MORE_INPUT, TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF}, DecompressorOxide}, TINFLStatus};
+use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "antisplat")]
@@ -15,7 +16,7 @@ use crate::rad::{RAD_CHUNK_MAGIC, RAD_MAGIC, RadDecoder};
 #[cfg(feature = "sogs")]
 use crate::sogs::{PK_MAGIC, SogsDecoder};
 #[cfg(feature = "spz")]
-use crate::spz::{SPZ_MAGIC, SpzDecoder};
+use crate::spz::{GZIP_MAGIC, SPZ_MAGIC, SpzDecoder};
 
 pub trait ChunkReceiver: Any {
     fn push(&mut self, bytes: &[u8]) -> anyhow::Result<()>;
@@ -451,8 +452,6 @@ impl<T: SplatReceiver> MultiDecoder<T> {
     }
 }
 
-const GZIP_MAGIC: u32 = 0x00088b1f; // Gzip deflate
-
 impl<T: SplatReceiver> ChunkReceiver for MultiDecoder<T> {
     fn push(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         if self.file_type.is_none() {
@@ -468,6 +467,11 @@ impl<T: SplatReceiver> ChunkReceiver for MultiDecoder<T> {
                 #[cfg(feature = "ply")]
                 (_, PLY_MAGIC) => {
                     return self.init_file_type(SplatFileType::PLY);
+                }
+                #[cfg(feature = "spz")]
+                (SPZ_MAGIC, _) => {
+                    // SPZ v4 files have NGSP magic at file start
+                    return self.init_file_type(SplatFileType::SPZ);
                 }
                 #[cfg(feature = "spz")]
                 (_, GZIP_MAGIC) => {
@@ -547,95 +551,24 @@ fn new_decoder<T: SplatReceiver>(file_type: SplatFileType, splats: T) -> Box<dyn
 
 #[cfg(feature = "spz")]
 fn try_gunzip(buffer: &[u8], max_bytes: usize) -> anyhow::Result<Option<Vec<u8>>> {
+    // At least 10 bytes are needed to cover the GZIP header, no use decoding less
     if buffer.len() < 10 {
-        return Ok(None);
-    }
-    if buffer[0] != 0x1f || buffer[1] != 0x8b || buffer[2] != 8 {
-        return Err(anyhow::anyhow!("Invalid gzip header"));
-    }
-
-    let flags = buffer[3];
-    let mut end = 10;
-
-    if (flags & 0x04) != 0 {
-        if buffer.len() < end + 2 {
-            return Ok(None);
-        }
-        let extra_len = (buffer[end] as usize) | ((buffer[end + 1] as usize) << 8);
-        end += 2;
-        if buffer.len() < end + extra_len {
-            return Ok(None);
-        }
-        end += extra_len;
-    }
-
-    if (flags & 0x08) != 0 {
-        let mut null = end;
-        let mut found = false;
-        while null < buffer.len() {
-            if buffer[null] == 0 {
-                null += 1;
-                found = true;
-                break;
-            }
-            null += 1;
-        }
-        if !found {
-            return Ok(None);
-        }
-        end = null;
-    }
-
-    if (flags & 0x10) != 0 {
-        let mut null = end;
-        let mut found = false;
-        while null < buffer.len() {
-            if buffer[null] == 0 {
-                null += 1;
-                found = true;
-                break;
-            }
-            null += 1;
-        }
-        if !found {
-            return Ok(None);
-        }
-        end = null;
-    }
-
-    if (flags & 0x02) != 0 {
-        if buffer.len() < end + 2 {
-            return Ok(None);
-        }
-        end += 2;
-    }
-    
-    if buffer.len() <= end {
         return Ok(None);
     }
 
     let mut buffer_gz = vec![0u8; max_bytes];
-    let mut decompressor = DecompressorOxide::new();
-    let (status, _in_consumed, out_written) = decompress(
-        &mut decompressor,
-        &buffer[end..],
-        &mut buffer_gz,
-        0,
-        TINFL_FLAG_HAS_MORE_INPUT | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
-    );
-    match status {
-        TINFLStatus::Failed => {
-            Ok(Some(Vec::new()))
-        }
-        TINFLStatus::Done | TINFLStatus::HasMoreOutput => {
+    let mut decoder = GzDecoder::new(buffer);
+    let out = decoder.read(&mut buffer_gz);
+    match out {
+        Ok(out_written) if out_written < max_bytes => Ok(None),
+        Ok(out_written) => {
             buffer_gz.truncate(out_written);
             Ok(Some(buffer_gz))
-        }
-        TINFLStatus::NeedsMoreInput => {
-            // Do nothing, try again next time
-            Ok(None)
-        }
-        _ => Err(anyhow::anyhow!("Decompression failed: {:?}", status))
+        },
+        Err(error) => match error.kind() {
+            ErrorKind::UnexpectedEof => Ok(None),
+            _ => Ok(Some(Vec::new()))
+        },
     }
 }
 

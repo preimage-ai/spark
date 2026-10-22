@@ -178,6 +178,10 @@ export default defineConfig(({ mode }) => {
 
     test: {
       setupFiles: ["test/unit/setup.ts"],
+      coverage: {
+        provider: "v8",
+      },
+      restoreMocks: true,
     },
   };
 });

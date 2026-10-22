@@ -383,6 +383,8 @@ export class SparkRenderer extends THREE.Mesh {
   current: SplatAccumulator;
   accumulators: SplatAccumulator[] = [];
 
+  private isDisposed = false;
+
   sorting = false;
   sortDirty = false;
   // Mapping version the latest update produced.
@@ -428,6 +430,7 @@ export class SparkRenderer extends THREE.Mesh {
   lodIdToSplats: Map<number, PackedSplats | ExtSplats | PagedSplats> =
     new Map();
   lodInitQueue: (PackedSplats | ExtSplats | PagedSplats)[] = [];
+  private lodInitFailed = new WeakSet<PackedSplats | ExtSplats | PagedSplats>();
   lastLod?: {
     pos: THREE.Vector3;
     quat: THREE.Quaternion;
@@ -699,6 +702,8 @@ export class SparkRenderer extends THREE.Mesh {
   }
 
   dispose() {
+    this.isDisposed = true;
+
     // @ts-ignore Object3D has a dispose method in Three.js >= r186
     super.dispose?.();
 
@@ -737,11 +742,10 @@ export class SparkRenderer extends THREE.Mesh {
       accumulator.dispose();
     }
 
-    const instances = this.lodInstances.values();
-    this.lodInstances.clear();
-    for (const instance of instances) {
+    for (const instance of this.lodInstances.values()) {
       instance.texture.dispose();
     }
+    this.lodInstances.clear();
 
     if (this.sortWorker) {
       this.sortWorker.dispose();
@@ -757,8 +761,15 @@ export class SparkRenderer extends THREE.Mesh {
     }
   }
 
+  // dispose() rejects the work it interrupts.
+  private dropErrorIfDisposed(error: unknown) {
+    if (!this.isDisposed) {
+      throw error;
+    }
+  }
+
   setDirty() {
-    if (!this.dirty) {
+    if (!this.isDisposed && !this.dirty) {
       this.dirty = true;
       this.onDirty?.();
     }
@@ -782,20 +793,24 @@ export class SparkRenderer extends THREE.Mesh {
         ? renderer.xr.getCamera()
         : camera;
       if (preUpdate) {
-        spark.updateInternal({
-          scene,
-          camera: useCamera,
-          autoUpdate: true,
-        });
+        spark
+          .updateInternal({
+            scene,
+            camera: useCamera,
+            autoUpdate: true,
+          })
+          .catch((error) => spark.dropErrorIfDisposed(error));
       } else {
         if (spark.updateTimeoutId === undefined) {
           spark.updateTimeoutId = setTimeout(() => {
             spark.updateTimeoutId = undefined;
-            spark.updateInternal({
-              scene,
-              camera: useCamera,
-              autoUpdate: true,
-            });
+            spark
+              .updateInternal({
+                scene,
+                camera: useCamera,
+                autoUpdate: true,
+              })
+              .catch((error) => spark.dropErrorIfDisposed(error));
           }, 1);
         }
       }
@@ -804,7 +819,13 @@ export class SparkRenderer extends THREE.Mesh {
     // Determine render target
     const currentRenderTarget = renderer.getRenderTarget();
     const isXRRenderTarget = checkIsXRRenderTarget(currentRenderTarget);
-    if (currentRenderTarget) {
+    // Objects like Reflector reset the renderer's current viewport, so prefer
+    // the camera's own viewport.
+    const viewport =
+      camera.viewport ?? renderer.getCurrentViewport(new THREE.Vector4());
+    if (viewport.z > 1 && viewport.w > 1) {
+      spark.renderSize.set(viewport.z, viewport.w);
+    } else if (currentRenderTarget) {
       spark.renderSize.set(
         currentRenderTarget.width,
         currentRenderTarget.height,
@@ -949,6 +970,9 @@ export class SparkRenderer extends THREE.Mesh {
     camera: THREE.Camera;
     autoUpdate: boolean;
   }) {
+    if (this.isDisposed) {
+      return;
+    }
     const renderer = this.renderer;
     if (this.ownsTimer) {
       this.timer.update();
@@ -1056,6 +1080,7 @@ export class SparkRenderer extends THREE.Mesh {
 
   private async driveSort() {
     if (
+      this.isDisposed ||
       this.sorting ||
       !this.sortDirty ||
       this.latestMappingVersion !== this.current.mappingVersion ||
@@ -1076,7 +1101,7 @@ export class SparkRenderer extends THREE.Mesh {
     if (now < nextSortTime) {
       this.sortTimeoutId = setTimeout(() => {
         this.sortTimeoutId = undefined;
-        this.driveSort();
+        this.driveSort().catch((error) => this.dropErrorIfDisposed(error));
       }, nextSortTime - now);
       return;
     }
@@ -1087,6 +1112,10 @@ export class SparkRenderer extends THREE.Mesh {
 
     if (this.readPause > 0) {
       await new Promise((resolve) => setTimeout(resolve, this.readPause));
+    }
+
+    if (this.isDisposed) {
+      return;
     }
 
     const current = this.current;
@@ -1114,6 +1143,9 @@ export class SparkRenderer extends THREE.Mesh {
       await new Promise((resolve) => setTimeout(resolve, this.sortPause));
     }
 
+    if (this.isDisposed) {
+      return;
+    }
     if (!this.sortWorker) {
       this.sortWorker = new SplatWorker();
     }
@@ -1125,6 +1157,10 @@ export class SparkRenderer extends THREE.Mesh {
 
     if (this.sortDelay > 0) {
       await new Promise((resolve) => setTimeout(resolve, this.sortDelay));
+    }
+
+    if (this.isDisposed) {
+      return;
     }
 
     this.readback32 = result.readback;
@@ -1176,7 +1212,7 @@ export class SparkRenderer extends THREE.Mesh {
     this.sorting = false;
     this.setDirty();
 
-    this.driveSort();
+    this.driveSort().catch((error) => this.dropErrorIfDisposed(error));
   }
 
   private ensureLodWorker() {
@@ -1213,7 +1249,8 @@ export class SparkRenderer extends THREE.Mesh {
 
     let pixelScaleLimit = 0.0;
     if (camera instanceof THREE.PerspectiveCamera) {
-      const tanYfov = Math.tan((0.5 * camera.fov * Math.PI) / 180);
+      // three.js leaves fov at its default on the WebXR camera
+      const tanYfov = 1.0 / camera.projectionMatrix.elements[5];
       pixelScaleLimit = (2.0 * tanYfov) / this.renderSize.y;
     } else if (camera instanceof THREE.OrthographicCamera) {
       // Effective visible size after zoom
@@ -1239,9 +1276,12 @@ export class SparkRenderer extends THREE.Mesh {
     }
 
     if (this.lastLod) {
+      if (this.lastLod.maxSplats !== maxSplats) {
+        this.lodDirty = true;
+      }
       if (
-        this.lastLod.pixelScaleLimit !== pixelScaleLimit ||
-        this.lastLod.maxSplats !== maxSplats
+        Math.abs(this.lastLod.pixelScaleLimit - pixelScaleLimit) >
+        1e-5 * pixelScaleLimit
       ) {
         this.lodDirty = true;
       }
@@ -1302,7 +1342,7 @@ export class SparkRenderer extends THREE.Mesh {
         const record = this.lodIds.get(splats);
         if (record) {
           record.lastTouched = now;
-        } else {
+        } else if (!this.lodInitFailed.has(splats)) {
           this.lodInitQueue.push(splats);
         }
       }
@@ -1318,6 +1358,8 @@ export class SparkRenderer extends THREE.Mesh {
           pixelScaleLimit,
           maxSplats,
         });
+      } catch (error) {
+        this.dropErrorIfDisposed(error);
       } finally {
         // driveLod() skips tryExclusive while this runs, so work it flagged
         // (lodDirty, lodInitQueue) would otherwise wait for an unrelated render.
@@ -1384,8 +1426,16 @@ export class SparkRenderer extends THREE.Mesh {
       while (lodInitQueue.length > 0) {
         const splats = lodInitQueue.shift();
         if (splats) {
-          await this.initLodTree(worker, splats);
-          this.lodDirty = true;
+          try {
+            await this.initLodTree(worker, splats);
+            this.lodDirty = true;
+          } catch (error) {
+            if (this.isDisposed) {
+              return;
+            }
+            this.lodInitFailed.add(splats);
+            console.error("initLodTree error", error);
+          }
         }
       }
     }
