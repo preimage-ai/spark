@@ -43,6 +43,44 @@ export default defineConfig(({ mode }) => {
   return {
     appType: "mpa",
 
+    // Resolve `spark-rs` to the Rust build output directly, NOT through
+    // node_modules. This is a correctness fix, not a convenience.
+    //
+    // `spark-rs` is declared as `file:rust/spark-rs/pkg`, which bun materialises
+    // as a separate copy under node_modules/.bun/. That copy starts life
+    // hard-linked to pkg/, so the two agree - until `build:wasm` runs:
+    //
+    //   1. wasm-pack writes its wasm-bindgen output INTO the shared inode, so
+    //      node_modules sees it too.
+    //   2. wasm-opt then replaces pkg/spark_rs_bg.wasm with a NEW file,
+    //      breaking the hard link.
+    //
+    // pkg/ ends up with the optimized wasm; node_modules stays frozen on the
+    // pre-wasm-opt intermediate (~1.93 MB vs ~1.67 MB). Since src/wasm.ts
+    // imports the binary by package specifier, the build inlined that
+    // intermediate - a ~350 kB regression that every timestamp reported as
+    // fresh, and that `npm run build:wasm && npm run build` could not fix
+    // because the second half never saw the first half's real output.
+    //
+    // Worse, the stale copy survives a package rename: an orphaned
+    // node_modules/.bun entry for the OLD directory name kept serving a wasm
+    // from weeks earlier, which is how a release shipped without the
+    // clustered-SH fix that was sitting in the source tree.
+    //
+    // Pointing at pkg/ makes build:wasm -> build deterministic and removes
+    // node_modules from the wasm's path entirely. The regex keeps the bare
+    // specifier and subpath+query imports (`spark-rs/spark_rs_bg.wasm?...`)
+    // both resolving to the same place, so the JS glue and the binary can
+    // never again come from different builds.
+    resolve: {
+      alias: [
+        {
+          find: /^spark-rs(\/.*)?$/,
+          replacement: `${path.resolve(import.meta.dirname, "rust/spark-rs/pkg")}$1`,
+        },
+      ],
+    },
+
     plugins: [
       arraybuffer(),
       glsl({
