@@ -54,6 +54,16 @@ enum BuildLodMethod {
 #[derive(Clone, Debug, Default)]
 struct BuildLodOptions {
     unlod: bool,
+    /// Write the splats as-is instead of building an LoD tree over them.
+    ///
+    /// `--unlod` strips a RAD back to its leaves but then immediately rebuilds
+    /// a tree, so the output always carries LoD nodes and (for SPZ) the 0x80
+    /// `lod_tree` header flag, which is a Spark extension. A third-party viewer
+    /// ignores that flag and draws the internal nodes too, on top of the
+    /// leaves and fully opaque, since LoD nodes encode opacity above 1 and a
+    /// plain viewer clamps it. Pair with `--unlod` to export just the leaves
+    /// for an external viewer or a like-for-like comparison.
+    no_lod: bool,
     tsplat: BuildLodTsplat,
     method: BuildLodMethod,
     max_sh: Option<usize>,
@@ -216,6 +226,17 @@ fn process_file_lod_tsplat<TS: SplatReceiver + TsplatArray + SplatGetter>(filena
     };
     description.insert("method".to_string(), serde_json::Value::String(format!("{:?}", method)));
 
+    // --no-lod skips BOTH the tree build and the chunking. They go together:
+    // chunk_tree orders splats by the tree it just built, so chunking without
+    // a tree is meaningless, and leaving either one in is what puts the LoD
+    // nodes (and the SPZ 0x80 flag) into the output.
+    if options.no_lod {
+        println!("Skipping LoD tree build and chunking (--no-lod)");
+        description.insert("no_lod".to_string(), serde_json::Value::Bool(true));
+        let final_splat_count = splats.len();
+        description.insert("final_splat_count".to_string(), serde_json::Value::Number(final_splat_count.into()));
+        println!("Writing {} splats as-is", final_splat_count);
+    } else {
     let start_time = std::time::Instant::now();
 
     match method {
@@ -241,6 +262,7 @@ fn process_file_lod_tsplat<TS: SplatReceiver + TsplatArray + SplatGetter>(filena
 
     let chunk_duration = start_time.elapsed();
     description.insert("chunk_duration".to_string(), serde_json::Number::from_f64(chunk_duration.as_secs_f64()).into());
+    }
 
     let num_sh = TsplatArray::max_sh_degree(&splats);
     description.insert("max_sh_degree".to_string(), serde_json::Value::Number(num_sh.into()));
@@ -404,6 +426,7 @@ fn process_file_lod_tsplat<TS: SplatReceiver + TsplatArray + SplatGetter>(filena
 fn show_usage_exit() {
     eprintln!("Usage: build-lod");
     eprintln!("  [--unlod]                                       // Remove LoD nodes with children from file");
+    eprintln!("  [--no-lod]                                      // Write splats as-is, no LoD tree (pair with --unlod to export leaves for other viewers)");
     eprintln!("  [--csplat] [--gsplat]                           // Use compact (csplat) or higher-precision (default gsplat) splat encoding");
     eprintln!("  [--quick] [--quality]                           // Use quick (tiny-lod) or quality (bhatt-lod) LoD method (default quality)");
     eprintln!("  [--tiny-lod[=<base>]] [--bhatt-lod[=<base>]]    // Use tiny-lod (default base 1.5) or bhatt-lod (default base 1.75) LoD method");
@@ -428,6 +451,11 @@ fn main() {
     let mut filenames = Vec::new();
 
     for arg in args {
+        if arg == "--no-lod" {
+            options.no_lod = true;
+            println!("Using --no-lod: write splats as-is, without building an LoD tree");
+            continue;
+        }
         if arg == "--unlod" {
             options.unlod = true;
             println!("Using --unlod: Un-LoD file by removing nodes with children");
