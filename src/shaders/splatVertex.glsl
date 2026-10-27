@@ -763,6 +763,35 @@ void main() {
     }
 
     if (gutMode) {
+        // PREIMAGE: decode Spark's >1 "super-opacity" before handing the splat to
+        // gutSplat. Not in the upstream patch, which only ever loaded one flat PLY
+        // and so never saw it; paged RAD does.
+        //
+        // Spark's LoD merges several splats into one and records the extra opacity
+        // as alpha > 1 (1..2 encoding the 1..5 range decoded below). The non-gut
+        // path a few lines down either turns that into a physically larger splat
+        // (lodInflate: volume scales with opacity, hence the cube root) or widens
+        // adjustedStdDev. gutSplat does neither -- it reads rgba.a straight into
+        // `opacity` and uses it for the alpha cull, for gutMinAlpha / opacity in
+        // the cutoff radius, and for alpha = min(maxAlpha, response * opacity).
+        // Left alone, a merged splat would therefore draw at its un-inflated size
+        // and saturate against maxAlpha: visibly too small and too opaque at every
+        // LoD level above the leaves.
+        //
+        // The arithmetic is copied from the block below rather than re-derived, so
+        // the two paths inflate identically. 3DGUT has no analogue of the
+        // adjustedStdDev widening, so with lodInflate off the only honest option is
+        // to clamp -- opacity must be <= 1 for `response * opacity` to mean
+        // anything, and maxAlpha (0.99) would clamp it regardless.
+        if (rgba.a > 1.0) {
+            float lodAlpha = min(rgba.a * 4.0 - 3.0, 5.0);
+            if (lodInflate) {
+                float lodOpacity = exp((lodAlpha * lodAlpha - 1.0) / 2.718281828459045);
+                scales *= pow(lodOpacity, 1.0 / 3.0);
+                lodAlpha = 1.0;
+            }
+            rgba.a = min(lodAlpha, 1.0);
+        }
         gutSplat(center, scales, quaternion, rgba);
         return;
     }
