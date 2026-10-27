@@ -15,9 +15,18 @@
       "`version` = our artifact, `sparkBase` = the upstream tag we are rebased onto.",
       "Keep `sparkBase` truthful - it is the only machine-readable record of what this is,",
       "so update it in the SAME commit as any upstream rebase.",
-      "Local deltas on top of sparkBase: the 3DGUT projection port (splatVertex.glsl,",
-      "splatFragment.glsl) and clustered-SH read support in spark-lib (GsplatArray's",
-      "set_sh_labels / set_sh*_codes, which are empty stubs upstream through v2.4.0)."
+      "Local deltas on top of sparkBase, with sizes against the sparkBase tag:",
+      "  - the 3DGUT projection port: splatVertex.glsl +204 -6, splatFragment.glsl",
+      "    +53 -16, SparkRenderer.ts +12 (the enable3DGUT option).",
+      "  - clustered-SH read support in spark-lib: gsplat.rs +101 (GsplatArray's",
+      "    set_sh_labels / set_sh*_codes, which are empty stubs upstream through v2.4.0).",
+      "  - build-lod --no-lod: build-lod/src/main.rs +28, exports splats without",
+      "    rebuilding an LoD tree.",
+      "Note the 3DGUT delta is expected to be REPLACED, not extended: see",
+      "preimage-viewer-v2/tasks.md section 2. The standalone FullCircle viewer",
+      "(~/code/spark_viewer_shreyansh) carries a 3DGUT-matched renderer validated",
+      "against NVIDIA 3DGRUT's CUDA reference, and its patch applies to this same",
+      "sparkBase; the plan is to revert the three files above and apply it instead."
     ]
   },
   "publishConfig": {
