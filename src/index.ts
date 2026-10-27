@@ -1,6 +1,9 @@
 export {
   SparkRenderer,
   type SparkRendererOptions,
+  type GutRenderSettings,
+  type GutCamera,
+  DEFAULT_GUT_SETTINGS,
 } from "./SparkRenderer";
 export { SplatAccumulator, type GeneratorMapping } from "./SplatAccumulator";
 

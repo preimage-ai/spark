@@ -21,6 +21,104 @@ import {
   uploadU32DataTextureRows,
 } from "./utils";
 
+/**
+ * Settings of the 3DGUT-matched render mode (FullCircle / NVIDIA 3DGRUT "3dgut" renderer).
+ * Names follow FullCircle's `render` config section (parsed.yaml).
+ */
+export interface GutRenderSettings {
+  /** render.particle_kernel_degree: generalized Gaussian degree n, response = exp(-4.5/3^n * d^n) */
+  kernelDegree: number;
+  /** render.particle_kernel_min_response: hits with a lower kernel response are rejected */
+  minResponse: number;
+  /** render.particle_kernel_min_alpha: hits with alpha <= minAlpha are rejected (and particles below are culled) */
+  minAlpha: number;
+  /** render.particle_kernel_max_alpha: per-hit alpha clamp */
+  maxAlpha: number;
+  /**
+   * render.min_transmittance. Informational only: Spark blends back-to-front, so the
+   * early ray termination of the reference (error <= minTransmittance) is not reproduced.
+   */
+  minTransmittance: number;
+  /** 3DGUT's ParticleMinSensorDistance: particles whose centre is closer to the camera are culled */
+  minSensorDistance: number;
+  /**
+   * Debug: emulate 3DGUT's tile-level footprint culling (unscented-transform projected conic
+   * tested against 16x16 pixel tiles, plus the silhouette bound of boundFootprint). Off by default:
+   * every particle is evaluated over its exact silhouette, which is what 3DGUT renders since its
+   * silhouette footprint was extended to pinhole cameras.
+   */
+  tileEmulation: boolean;
+  /**
+   * Skip particles whose cutoff ellipsoid lies entirely outside the pinhole view frustum before
+   * computing their footprint. The image is unchanged; it saves vertex work, which dominates on
+   * phone GPUs. Off by default.
+   */
+  earlyCull: boolean;
+  /** render.splat.tile_based_culling */
+  tileBasedCulling: boolean;
+  /** render.splat.rect_bounding */
+  rectBounding: boolean;
+  /** render.splat.tight_opacity_bounding */
+  tightOpacityBounding: boolean;
+  /** render.splat.mip_splatting_scaling (only affects culling, not the hit test) */
+  mipSplattingScaling: boolean;
+  /** render.splat.ut_alpha / ut_beta / ut_kappa / ut_in_image_margin_factor */
+  utAlpha: number;
+  utBeta: number;
+  utKappa: number;
+  utInImageMarginFactor: number;
+  /** 3DGUT's CovarianceDilation added to the projected covariance for culling */
+  covarianceDilation: number;
+  /** 3DGUT tile size in pixels */
+  tileSize: number;
+  /** render.splat.global_z_order: sort by camera z instead of distance to the camera centre */
+  globalZOrder: boolean;
+}
+
+/**
+ * Camera model for gutMode. Pinhole cameras take their intrinsics from the three.js
+ * projection matrix. An OpenCV fisheye camera (as used by FullCircle for dual-fisheye
+ * captures) needs its intrinsics, for culling and footprints, and a ray map: a
+ * width x height RGBA float texture with the camera-space ray direction of every pixel
+ * (OpenCV axes: x right, y down, z forward; row 0 = top image row; w = 1 valid, 0 masked).
+ * The render target must have the ray map's resolution.
+ */
+export type GutCamera =
+  | { model: "pinhole" }
+  | {
+      model: "fisheye";
+      fx: number;
+      fy: number;
+      cx: number;
+      cy: number;
+      /** radial coefficients k1..k4 */
+      k: [number, number, number, number];
+      maxAngle: number;
+      rayMap: THREE.Texture;
+    };
+
+export const DEFAULT_GUT_SETTINGS: GutRenderSettings = {
+  kernelDegree: 2,
+  minResponse: 0.0,
+  minAlpha: 1.0 / 255.0,
+  maxAlpha: 0.99,
+  minTransmittance: 0.0001,
+  minSensorDistance: 0.01,
+  tileEmulation: false,
+  earlyCull: false,
+  tileBasedCulling: true,
+  rectBounding: true,
+  tightOpacityBounding: true,
+  mipSplattingScaling: true,
+  utAlpha: 1.0,
+  utBeta: 2.0,
+  utKappa: 0.0,
+  utInImageMarginFactor: 0.1,
+  covarianceDilation: 0.3,
+  tileSize: 16,
+  globalZOrder: true,
+};
+
 export interface SparkRendererOptions {
   /**
    * Pass in your THREE.WebGLRenderer instance so Spark can perform work
@@ -329,6 +427,21 @@ export interface SparkRendererOptions {
    * @default undefined = false
    */
   depthWrite?: boolean;
+  /**
+   * Render like FullCircle's 3DGUT renderer: each fragment evaluates the particle along its
+   * camera ray (generalized Gaussian kernel, 3DGUT thresholds), splat quads cover the exact
+   * silhouette of the particle's cutoff ellipsoid, and sorting follows `gut.globalZOrder`.
+   * Use together with accumExtSplats: true for full precision.
+   * @default false
+   */
+  gutMode?: boolean;
+  /** Settings for gutMode, see GutRenderSettings. @default DEFAULT_GUT_SETTINGS */
+  gut?: Partial<GutRenderSettings>;
+  /**
+   * Force (true) or disable (false) sRGB->linear conversion of splat colors.
+   * @default undefined = automatic from the output color space
+   */
+  encodeLinear?: boolean;
 }
 
 export class SparkRenderer extends THREE.Mesh {
@@ -359,6 +472,10 @@ export class SparkRenderer extends THREE.Mesh {
 
   sortRadial: boolean;
   minSortIntervalMs: number;
+  gutMode: boolean;
+  gut: GutRenderSettings;
+  gutCamera: GutCamera = { model: "pinhole" };
+  encodeLinear?: boolean;
 
   readonly timer: THREE.Timer;
   private readonly ownsTimer: boolean;
@@ -539,6 +656,9 @@ export class SparkRenderer extends THREE.Mesh {
 
     this.sortRadial = options.sortRadial ?? true;
     this.minSortIntervalMs = options.minSortIntervalMs ?? 0;
+    this.gutMode = options.gutMode ?? false;
+    this.gut = { ...DEFAULT_GUT_SETTINGS, ...(options.gut ?? {}) };
+    this.encodeLinear = options.encodeLinear;
 
     this.enableLod = options.enableLod ?? true;
     // enableDriveLod defaults to true if enableLod is true, false otherwise
@@ -686,6 +806,30 @@ export class SparkRenderer extends THREE.Mesh {
       deltaTime: { value: 0 },
       // Debug flag that alternates each frame
       debugFlag: { value: false },
+      // 3DGUT-matched rendering (see GutRenderSettings)
+      gutMode: { value: false },
+      gutKernelDegree: { value: 2 },
+      gutMinResponse: { value: 0.0 },
+      gutMinAlpha: { value: 1.0 / 255.0 },
+      gutMaxAlpha: { value: 0.99 },
+      gutMinSensorDistance: { value: 0.01 },
+      gutTileEmulation: { value: false },
+      gutEarlyCull: { value: false },
+      gutTileBasedCulling: { value: true },
+      gutRectBounding: { value: true },
+      gutTightOpacityBounding: { value: true },
+      gutMipSplattingScaling: { value: true },
+      gutUtParams: { value: new THREE.Vector4(1.0, 2.0, 0.0, 0.1) },
+      gutCovarianceDilation: { value: 0.3 },
+      gutTileSize: { value: 16.0 },
+      gutCameraModel: { value: 0 },
+      gutFisheyeIntr: { value: new THREE.Vector4(1, 1, 0, 0) },
+      gutFisheyeK: { value: new THREE.Vector4(0, 0, 0, 0) },
+      gutFisheyeMaxAngle: { value: Math.PI },
+      gutRayMap: {
+        type: "t",
+        value: SparkRenderer.emptyRayMap as THREE.Texture,
+      },
     };
     return uniforms;
   }
@@ -884,7 +1028,45 @@ export class SparkRenderer extends THREE.Mesh {
           ? currentRenderTarget.texture.colorSpace
           : THREE.ColorManagement.workingColorSpace;
     this.uniforms.encodeLinear.value =
-      outputColorSpace !== THREE.SRGBColorSpace;
+      spark.encodeLinear ?? outputColorSpace !== THREE.SRGBColorSpace;
+
+    const gut = spark.gut;
+    this.uniforms.gutMode.value = spark.gutMode;
+    this.uniforms.gutKernelDegree.value = Math.round(gut.kernelDegree);
+    this.uniforms.gutMinResponse.value = gut.minResponse;
+    this.uniforms.gutMinAlpha.value = gut.minAlpha;
+    this.uniforms.gutMaxAlpha.value = gut.maxAlpha;
+    this.uniforms.gutMinSensorDistance.value = gut.minSensorDistance;
+    this.uniforms.gutTileEmulation.value = gut.tileEmulation;
+    this.uniforms.gutEarlyCull.value = gut.earlyCull;
+    this.uniforms.gutTileBasedCulling.value = gut.tileBasedCulling;
+    this.uniforms.gutRectBounding.value = gut.rectBounding;
+    this.uniforms.gutTightOpacityBounding.value = gut.tightOpacityBounding;
+    this.uniforms.gutMipSplattingScaling.value = gut.mipSplattingScaling;
+    this.uniforms.gutUtParams.value.set(
+      gut.utAlpha,
+      gut.utBeta,
+      gut.utKappa,
+      gut.utInImageMarginFactor,
+    );
+    this.uniforms.gutCovarianceDilation.value = gut.covarianceDilation;
+    this.uniforms.gutTileSize.value = gut.tileSize;
+    const gutCamera = spark.gutCamera;
+    if (gutCamera.model === "fisheye") {
+      this.uniforms.gutCameraModel.value = 1;
+      this.uniforms.gutFisheyeIntr.value.set(
+        gutCamera.fx,
+        gutCamera.fy,
+        gutCamera.cx,
+        gutCamera.cy,
+      );
+      this.uniforms.gutFisheyeK.value.set(...gutCamera.k);
+      this.uniforms.gutFisheyeMaxAngle.value = gutCamera.maxAngle;
+      this.uniforms.gutRayMap.value = gutCamera.rayMap;
+    } else {
+      this.uniforms.gutCameraModel.value = 0;
+      this.uniforms.gutRayMap.value = SparkRenderer.emptyRayMap;
+    }
 
     this.uniforms.ordering.value =
       spark.orderingTexture ?? SparkRenderer.emptyOrdering;
@@ -906,6 +1088,23 @@ export class SparkRenderer extends THREE.Mesh {
     this.uniforms.debugFlag.value = (performance.now() / 1000.0) % 2.0 < 1.0;
 
     spark.dirty = false;
+  }
+
+  // Sort metric: 3DGUT mode follows render.splat.global_z_order (camera z vs. distance to the
+  // camera centre); otherwise the sortRadial option.
+  effectiveSortRadial(): boolean {
+    return this.gutMode ? !this.gut.globalZOrder : (this.sortRadial ?? true);
+  }
+
+  // Force the splats to be regenerated and re-sorted on the next update, e.g. after
+  // changing gutMode or gut.globalZOrder without moving the camera.
+  forceResort() {
+    this.sortedCenter.set(
+      Number.POSITIVE_INFINITY,
+      Number.POSITIVE_INFINITY,
+      Number.POSITIVE_INFINITY,
+    );
+    this.setDirty();
   }
 
   clearSplats() {
@@ -990,7 +1189,8 @@ export class SparkRenderer extends THREE.Mesh {
         scene,
         timer: this.timer,
         camera,
-        sortRadial: this.sortRadial ?? true,
+        sortRadial: this.effectiveSortRadial(),
+        sortClampZ: this.gutMode && this.gut.globalZOrder,
         renderSize: this.renderSize,
         previous: this.current,
         lodInstances: this.enableLod ? this.lodInstances : undefined,
@@ -1894,6 +2094,18 @@ export class SparkRenderer extends THREE.Mesh {
     renderer.xr.enabled = state.xrEnabled;
     renderer.autoClear = state.autoClear;
   }
+
+  static emptyRayMap = (() => {
+    const texture = new THREE.DataTexture(
+      new Float32Array([0, 0, 1, 0]),
+      1,
+      1,
+      THREE.RGBAFormat,
+      THREE.FloatType,
+    );
+    texture.needsUpdate = true;
+    return texture;
+  })();
 
   private static emptyOrdering = (() => {
     const numIndices = 4 * 4096 * 1;

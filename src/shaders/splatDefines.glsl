@@ -170,6 +170,49 @@ vec4 decodeQuatOctXy1010R12(uint encoded) {
     return vec4(axis * s, w);
 }
 
+// Refined ext-splat quaternion: the 10/10/12-bit octahedral axis-angle code plus a 16-bit
+// refinement word (bit 15 = present; bits 0-4, 5-9, 10-14 = offsets + 16 of u, v and the angle
+// in 1/32 of the coarse step), extending it to 15/15/17 bits. Stored in the otherwise unused
+// upper half of the ext alpha word; decoders that ignore it get the plain coarse value.
+uint encodeQuatOctXy1010R12Ext(vec4 q, out uint refine) {
+    if (q.w < 0.0) {
+        q = -q;
+    }
+    float xyzLen = length(q.xyz);
+    // atan2 keeps small rotation angles accurate (acos(w) does not)
+    float theta = 2.0 * atan(xyzLen, q.w);
+    vec3 axis = (xyzLen < 1e-12) ? vec3(1.0, 0.0, 0.0) : q.xyz / xyzLen;
+    float sum = abs(axis.x) + abs(axis.y) + abs(axis.z);
+    vec2 p = vec2(axis.x, axis.y) / sum;
+    if (axis.z < 0.0) {
+        float oldPx = p.x;
+        p.x = (1.0 - abs(p.y)) * (p.x >= 0.0 ? 1.0 : -1.0);
+        p.y = (1.0 - abs(oldPx)) * (p.y >= 0.0 ? 1.0 : -1.0);
+    }
+    vec3 steps = vec3(1023.0, 1023.0, 4095.0);
+    vec3 f = round(clamp(vec3(p * 0.5 + 0.5, theta / PI), 0.0, 1.0) * steps * 32.0);
+    ivec3 fi = ivec3(f);
+    ivec3 coarse = min((fi + 16) >> 5, ivec3(steps));
+    uvec3 off = uvec3(fi - coarse * 32 + 16);
+    refine = 0x8000u | off.x | (off.y << 5u) | (off.z << 10u);
+    return (uint(coarse.z) << 20u) | (uint(coarse.y) << 10u) | uint(coarse.x);
+}
+
+vec4 decodeQuatOctXy1010R12Ext(uint encoded, uint refine) {
+    vec3 q = vec3(float(encoded & 0x3FFu), float((encoded >> 10u) & 0x3FFu), float(encoded >> 20u));
+    if ((refine & 0x8000u) != 0u) {
+        q += vec3(float(refine & 31u), float((refine >> 5u) & 31u), float((refine >> 10u) & 31u)) / 32.0 - 0.5;
+    }
+    vec2 f = q.xy / 1023.0 * 2.0 - 1.0;
+    vec3 axis = vec3(f.xy, 1.0 - abs(f.x) - abs(f.y));
+    float t = max(-axis.z, 0.0);
+    axis.x += (axis.x >= 0.0) ? -t : t;
+    axis.y += (axis.y >= 0.0) ? -t : t;
+    axis = normalize(axis);
+    float halfTheta = (q.z / 4095.0) * PI * 0.5;
+    return vec4(axis * sin(halfTheta), cos(halfTheta));
+}
+
 // Pack a Gsplat into a uvec4
 uvec4 packSplatEncoding(
     vec3 center, vec3 scales, vec4 quaternion, vec4 rgba, vec4 rgbMinMaxLnScaleMinMax
@@ -360,12 +403,13 @@ void packSplatExt(
     packedData.x = floatBitsToUint(center.x);
     packedData.y = floatBitsToUint(center.y);
     packedData.z = floatBitsToUint(center.z);
-    packedData.w = packHalf2x16(vec2(rgba.a, 0.0));
+    uint quatRefine;
+    packedData2.w = encodeQuatOctXy1010R12Ext(quaternion, quatRefine);
+    packedData.w = (packHalf2x16(vec2(rgba.a, 0.0)) & 0xFFFFu) | (quatRefine << 16u);
 
     packedData2.x = packHalf2x16(rgba.rg);
     packedData2.y = packHalf2x16(vec2(rgba.b, log(scales.x)));
     packedData2.z = packHalf2x16(log(scales.yz));
-    packedData2.w = encodeQuatOctXy1010R12(quaternion);
 }
 
 vec4 unpackSplatExtCenterAlpha(uvec4 packedData) {
@@ -395,7 +439,7 @@ void unpackSplatExt(
     rgba.b = split.x;
     scales.x = exp(split.y);
     scales.yz = exp(unpackHalf2x16(packedData2.z));
-    quaternion = decodeQuatOctXy1010R12(packedData2.w);
+    quaternion = decodeQuatOctXy1010R12Ext(packedData2.w, packedData.w >> 16u);
 }
 
 uint encodeExtRgb(vec3 rgb) {

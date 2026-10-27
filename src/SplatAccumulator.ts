@@ -64,6 +64,8 @@ export class SplatAccumulator {
   static viewCenterUniform = new DynoVec3({ value: new THREE.Vector3() });
   static viewDirUniform = new DynoVec3({ value: new THREE.Vector3() });
   static sortRadialUniform = new DynoBool({ value: true });
+  // Non-radial sort with 3DGUT's max(camera z, 0) key (see OutputSplatDepth)
+  static sortClampZUniform = new DynoBool({ value: false });
   maxSplats = 0;
   numSplats = 0;
   target: THREE.WebGLArrayRenderTarget | null = null;
@@ -223,7 +225,14 @@ export class SplatAccumulator {
       throw new Error("Either generator or covGenerator must be provided");
     }
 
-    let program = SplatAccumulator.generatorProgram.get(theGenerator);
+    // The compiled program depends on the accumulator encoding (ext/cov), so cache per encoding;
+    // otherwise two SparkRenderers with different accumExtSplats settings sharing a generator
+    // would reuse a program built for the wrong output template.
+    const programCache = SplatAccumulator.programCacheFor(
+      this.extSplats,
+      this.covSplats,
+    );
+    let program = programCache.get(theGenerator);
     if (!program) {
       const graph = dynoBlock(
         { index: "int" },
@@ -319,6 +328,7 @@ export class SplatAccumulator {
               SplatAccumulator.viewCenterUniform,
               SplatAccumulator.viewDirUniform,
               SplatAccumulator.sortRadialUniform,
+              SplatAccumulator.sortClampZUniform,
             );
             roots.push(outputDepth);
           }
@@ -344,7 +354,7 @@ export class SplatAccumulator {
         // consoleLog: true,
       });
 
-      SplatAccumulator.generatorProgram.set(theGenerator, program);
+      programCache.set(theGenerator, program);
     }
     Object.assign(program.uniforms, {
       targetLayer: { value: 0 },
@@ -367,6 +377,22 @@ export class SplatAccumulator {
     GsplatGenerator | CovSplatGenerator,
     DynoProgram
   >();
+  static generatorPrograms = new Map<
+    string,
+    WeakMap<GsplatGenerator | CovSplatGenerator, DynoProgram>
+  >();
+  static programCacheFor(extSplats: boolean, covSplats: boolean) {
+    if (!extSplats && !covSplats) {
+      return SplatAccumulator.generatorProgram;
+    }
+    const key = `${extSplats ? 1 : 0}${covSplats ? 1 : 0}`;
+    let cache = SplatAccumulator.generatorPrograms.get(key);
+    if (!cache) {
+      cache = new WeakMap();
+      SplatAccumulator.generatorPrograms.set(key, cache);
+    }
+    return cache;
+  }
   static fullScreenQuad = new FullScreenQuad(
     new THREE.RawShaderMaterial({ visible: false }),
   );
@@ -444,6 +470,7 @@ export class SplatAccumulator {
     timer,
     camera,
     sortRadial,
+    sortClampZ = false,
     renderSize,
     previous,
     lodInstances,
@@ -453,6 +480,7 @@ export class SplatAccumulator {
     timer: THREE.Timer;
     camera: THREE.Camera;
     sortRadial: boolean;
+    sortClampZ?: boolean;
     renderSize: THREE.Vector2;
     previous: SplatAccumulator;
     lodInstances?: Map<
@@ -466,6 +494,7 @@ export class SplatAccumulator {
     SplatAccumulator.viewCenterUniform.value.copy(this.viewOrigin);
     SplatAccumulator.viewDirUniform.value.copy(this.viewDirection);
     SplatAccumulator.sortRadialUniform.value = sortRadial;
+    SplatAccumulator.sortClampZUniform.value = sortClampZ;
 
     this.time = timer.getElapsed();
     this.deltaTime = timer.getDelta();

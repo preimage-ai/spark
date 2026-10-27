@@ -3,6 +3,7 @@ precision highp float;
 precision highp int;
 
 #include <splatDefines>
+#include <gutDefines>
 
 uniform float near;
 uniform float far;
@@ -13,6 +14,8 @@ uniform float maxStdDev;
 uniform float minAlpha;
 uniform bool disableFalloff;
 uniform float falloff;
+uniform vec2 renderSize;
+uniform highp sampler2D gutRayMap;
 
 out vec4 fragColor;
 
@@ -22,9 +25,64 @@ in vec3 vNdc;
 flat in uint vSplatIndex;
 flat in float adjustedStdDev;
 
+flat in vec3 vGutRow0;
+flat in vec3 vGutRow1;
+flat in vec3 vGutRow2;
+flat in vec3 vGutOrigin;
+flat in vec4 vGutColor;
+flat in vec4 vGutConic;
+flat in vec2 vGutCenter;
+flat in vec4 vGutTiles;
+
 #include <logdepthbuf_pars_fragment>
 
+// 3DGUT-matched fragment: evaluate the particle along this pixel's camera ray
+void gutFragment() {
+    // pixel coordinates from the top-left corner (pixel centres at +0.5), as in the reference
+    vec2 pix = vec2(gl_FragCoord.x, renderSize.y - gl_FragCoord.y);
+    if (gutTileEmulation) {
+        vec2 tile = floor(pix / gutTileSize);
+        if (any(lessThan(tile, vGutTiles.xy)) || any(greaterThanEqual(tile, vGutTiles.zw))) {
+            discard;
+        }
+        if (gutTileBasedCulling && !(gutTileMinPower(tile, vGutConic.xyz, vGutCenter) < vGutConic.w)) {
+            discard;
+        }
+    }
+    vec3 q = vec3(pix, 1.0);
+    if (gutCameraModel == 1) {
+        vec4 ray = texelFetch(gutRayMap, ivec2(pix), 0);
+        if (ray.w == 0.0) {
+            discard;
+        }
+        q = ray.xyz;
+    }
+    vec3 dc = normalize(vec3(dot(vGutRow0, q), dot(vGutRow1, q), dot(vGutRow2, q)));
+    vec3 cr = cross(dc, vGutOrigin);
+    float response = gutKernelResponse(gutKernelDegree, dot(cr, cr));
+    float alpha = min(gutMaxAlpha, response * vGutColor.a);
+    bool inFront = dot(dc, vGutOrigin) < 0.0;
+    if (!(inFront && (response > gutMinResponse) && (alpha > gutMinAlpha))) {
+        discard;
+    }
+    vec3 rgb = vGutColor.rgb;
+    if (encodeLinear) {
+        rgb = srgbToLinear(rgb);
+    }
+    #ifdef PREMULTIPLIED_ALPHA
+        fragColor = vec4(rgb * alpha, alpha);
+    #else
+        fragColor = vec4(rgb, alpha);
+    #endif
+}
+
 void main() {
+    if (gutMode) {
+        gutFragment();
+        #include <logdepthbuf_fragment>
+        return;
+    }
+
     vec4 rgba = vRgba;
 
     float z2 = dot(vSplatUv, vSplatUv);

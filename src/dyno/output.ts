@@ -29,7 +29,9 @@ export const outputSplatDepth = (
   viewCenter: DynoVal<"vec3">,
   viewDir: DynoVal<"vec3">,
   sortRadial: DynoVal<"bool">,
-) => new OutputSplatDepth({ gsplat, viewCenter, viewDir, sortRadial });
+  sortClampZ?: DynoVal<"bool">,
+) =>
+  new OutputSplatDepth({ gsplat, viewCenter, viewDir, sortRadial, sortClampZ });
 
 export const outputCovSplatDepth = (
   covsplat: DynoVal<typeof CovSplat>,
@@ -173,6 +175,7 @@ class OutputSplatDepth extends Dyno<
     viewCenter: "vec3";
     viewDir: "vec3";
     sortRadial: "bool";
+    sortClampZ: "bool";
   },
   Record<string, never>
 > {
@@ -181,11 +184,13 @@ class OutputSplatDepth extends Dyno<
     viewCenter,
     viewDir,
     sortRadial,
+    sortClampZ,
   }: {
     gsplat: DynoVal<typeof Gsplat>;
     viewCenter: DynoVal<"vec3">;
     viewDir: DynoVal<"vec3">;
     sortRadial: DynoVal<"bool">;
+    sortClampZ?: DynoVal<"bool">;
   }) {
     super({
       inTypes: {
@@ -193,18 +198,26 @@ class OutputSplatDepth extends Dyno<
         viewCenter: "vec3",
         viewDir: "vec3",
         sortRadial: "bool",
+        sortClampZ: "bool",
       },
-      inputs: { gsplat, viewCenter, viewDir, sortRadial },
+      inputs: { gsplat, viewCenter, viewDir, sortRadial, sortClampZ },
       globals: () => [defineGsplat],
       statements: ({ inputs }) => {
-        const { gsplat, viewCenter, viewDir, sortRadial } = inputs;
+        const { gsplat, viewCenter, viewDir, sortRadial, sortClampZ } = inputs;
         if (gsplat && viewCenter && viewDir && sortRadial) {
+          // sortClampZ (3DGUT global_z_order): key max(z, 0) front-to-back with ties in ascending
+          // splat index. Back-to-front here, so z > 0 maps to 1 + z and all z <= 0 splats to
+          // [0.5, 1) increasing with the index (exact float spacing 2^-24 up to 2^23 splats).
+          const clampZ = sortClampZ ?? "false";
           return unindentLines(/* glsl */ `
             float metric = 1.0 / 0.0;
             if (isGsplatActive(${gsplat}.flags)) {
               vec3 center = ${gsplat}.center - ${viewCenter};
               if (${sortRadial}) {
                 metric = length(center);
+              } else if (${clampZ}) {
+                float z = dot(center, ${viewDir});
+                metric = (z > 0.0) ? 1.0 + z : 0.5 + float(min(${gsplat}.index, 8388607)) * exp2(-24.0);
               } else {
                 float bias = 100.0; // reduce popping
                 metric = dot(center, ${viewDir}) + bias;

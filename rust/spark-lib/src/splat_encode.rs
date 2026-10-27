@@ -125,14 +125,15 @@ pub fn decode_packed_splat_quat(packed: &[u32]) -> [f32; 4] {
 }
 
 pub fn encode_ext_splat(ext_a: &mut [u32], ext_b: &mut [u32], center: [f32; 3], opacity: f32, rgb: [f32; 3], scale: [f32; 3], quat_xyzw: [f32; 4]) {
+    let (quat, refine) = encode_quat_oct101012_ext(quat_xyzw);
     ext_a[0] = center[0].to_bits();
     ext_a[1] = center[1].to_bits();
     ext_a[2] = center[2].to_bits();
-    ext_a[3] = f16::from_f32(opacity).to_bits() as u32;
+    ext_a[3] = f16::from_f32(opacity).to_bits() as u32 | (refine << 16);
     ext_b[0] = f16::from_f32(rgb[0]).to_bits() as u32 | ((f16::from_f32(rgb[1]).to_bits() as u32) << 16);
     ext_b[1] = f16::from_f32(rgb[2]).to_bits() as u32 | ((f16::from_f32(scale[0].ln()).to_bits() as u32) << 16);
     ext_b[2] = f16::from_f32(scale[1].ln()).to_bits() as u32 | ((f16::from_f32(scale[2].ln()).to_bits() as u32) << 16);
-    ext_b[3] = encode_quat_oct101012(quat_xyzw);
+    ext_b[3] = quat;
 }
 
 pub fn encode_ext_splat_center(ext_a: &mut [u32], center: [f32; 3]) {
@@ -146,7 +147,8 @@ pub fn decode_ext_splat_center(ext_a: &[u32]) -> [f32; 3] {
 }
 
 pub fn encode_ext_splat_opacity(ext_a: &mut [u32], opacity: f32) {
-    ext_a[3] = f16::from_f32(opacity).to_bits() as u32;
+    // keep the quaternion refinement bits stored in the upper half
+    ext_a[3] = (ext_a[3] & 0xffff0000) | f16::from_f32(opacity).to_bits() as u32;
 }
 
 pub fn decode_ext_splat_opacity(ext_a: &[u32]) -> f32 {
@@ -183,12 +185,20 @@ pub fn decode_ext_splat_scale(ext_b: &[u32]) -> [f32; 3] {
         .map(|x| f16::from_bits(x).to_f32().exp())
 }
 
-pub fn encode_ext_splat_quat(ext_b: &mut [u32], quat_xyzw: [f32; 4]) {
-    ext_b[3] = encode_quat_oct101012(quat_xyzw);
+pub fn encode_ext_splat_quat(ext_a: &mut [u32], ext_b: &mut [u32], quat_xyzw: [f32; 4]) {
+    let (quat, refine) = encode_quat_oct101012_ext(quat_xyzw);
+    ext_a[3] = (ext_a[3] & 0xffff) | (refine << 16);
+    ext_b[3] = quat;
 }
 
+/// Coarse (10/10/12-bit) quaternion, ignoring the refinement bits.
 pub fn decode_ext_splat_quat(ext_b: &[u32]) -> [f32; 4] {
     decode_quat_oct101012(ext_b[3])
+}
+
+/// Full-precision quaternion including the refinement bits in the upper half of ext_a[3].
+pub fn decode_ext_splat_quat_ext(ext_a: &[u32], ext_b: &[u32]) -> [f32; 4] {
+    decode_quat_oct101012_ext(ext_b[3], ext_a[3] >> 16)
 }
 
 pub fn float_to_u8(value: f32, min: f32, max: f32) -> u8 {
@@ -249,6 +259,54 @@ pub fn encode_quat_oct101012(quat_xyzw: [f32; 4]) -> u32 {
     let [u, v] = p.map(|x| ((x * 0.5 + 0.5) * 1023.0).clamp(0.0, 1023.0).round() as u32);
     let r = (theta / std::f32::consts::PI * 4095.0).clamp(0.0, 4095.0).round() as u32;
     (r << 20) | (v << 10) | u
+}
+
+/// Octahedral axis (10+10 bit) + angle (12 bit) quaternion, plus a 16-bit refinement word that
+/// extends it to 15+15+17 bits: bit 15 flags its presence, bits 0-4 / 5-9 / 10-14 hold the offsets
+/// (+16) of u, v and the angle in 1/32 of the coarse step. Decoders that ignore the refinement word
+/// get the same coarse value as encode_quat_oct101012. Uses atan2 for the angle (acos(w) loses
+/// precision for small rotations).
+pub fn encode_quat_oct101012_ext(quat_xyzw: [f32; 4]) -> (u32, u32) {
+    let quat = if quat_xyzw[3] < 0.0 { quat_xyzw.map(|x| -x) } else { quat_xyzw };
+    let xyz_len = (quat[0] * quat[0] + quat[1] * quat[1] + quat[2] * quat[2]).sqrt();
+    let theta = 2.0 * xyz_len.atan2(quat[3]);
+    let axis = if xyz_len < 1e-12 { [1.0, 0.0, 0.0] } else { array::from_fn(|i| quat[i] / xyz_len) };
+    let sum = axis[0].abs() + axis[1].abs() + axis[2].abs();
+    let mut p: [f32; 2] = array::from_fn(|i| axis[i] / sum);
+    if axis[2] < 0.0 {
+        p = [
+            (1.0 - p[1].abs()) * if p[0] >= 0.0 { 1.0 } else { -1.0 },
+            (1.0 - p[0].abs()) * if p[1] >= 0.0 { 1.0 } else { -1.0 },
+        ];
+    }
+    let fine = |x: f32, steps: i32| -> (u32, u32) {
+        let f = (x * (steps * 32) as f32).clamp(0.0, (steps * 32) as f32).round() as i32;
+        let coarse = ((f + 16) >> 5).min(steps);
+        (coarse as u32, (f - coarse * 32 + 16) as u32)
+    };
+    let (u, uo) = fine(p[0] * 0.5 + 0.5, 1023);
+    let (v, vo) = fine(p[1] * 0.5 + 0.5, 1023);
+    let (r, ro) = fine(theta / std::f32::consts::PI, 4095);
+    ((r << 20) | (v << 10) | u, 0x8000 | uo | (vo << 5) | (ro << 10))
+}
+
+pub fn decode_quat_oct101012_ext(encoded: u32, refine: u32) -> [f32; 4] {
+    if refine & 0x8000 == 0 {
+        return decode_quat_oct101012(encoded);
+    }
+    let off = |shift: u32| ((refine >> shift) & 31) as f32 / 32.0 - 0.5;
+    let u = (encoded & 0x3ff) as f32 + off(0);
+    let v = ((encoded >> 10) & 0x3ff) as f32 + off(5);
+    let r = (encoded >> 20) as f32 + off(10);
+    let [x, y] = [u / 1023.0 * 2.0 - 1.0, v / 1023.0 * 2.0 - 1.0];
+    let z = 1.0 - x.abs() - y.abs();
+    let t = (-z).max(0.0);
+    let [x, y] = [x, y].map(|x| if x >= 0.0 { x - t } else { x + t });
+    let length = (x * x + y * y + z * z).sqrt();
+    let axis = [x / length, y / length, z / length];
+    let half_theta = r / 4095.0 * 0.5 * std::f32::consts::PI;
+    let (s, w) = half_theta.sin_cos();
+    [axis[0] * s, axis[1] * s, axis[2] * s, w]
 }
 
 pub fn decode_quat_oct101012(encoded: u32) -> [f32; 4] {
@@ -495,4 +553,58 @@ pub fn decode_lod_tree_children(buffer: &[u32]) -> (u16, u32) {
     let child_count = (buffer[2] & 0xffff) as u16;
     let child_start = buffer[3];
     (child_count, child_start)
+}
+
+#[cfg(test)]
+mod quat_ext_tests {
+    use super::*;
+
+    // rotation angle between two unit quaternions, computed in f64 (acos of an f32 dot product
+    // cannot resolve angles below ~1e-3)
+    fn angle_between(a: [f32; 4], b: [f32; 4]) -> f32 {
+        let a = a.map(|x| x as f64);
+        let b = b.map(|x| x as f64);
+        let s = if a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3] < 0.0 { -1.0 } else { 1.0 };
+        let d = (0..4).map(|i| (a[i] - s * b[i]).powi(2)).sum::<f64>().sqrt();
+        (4.0 * (d / 2.0).min(1.0).asin()) as f32
+    }
+
+    #[test]
+    fn refined_quaternion_roundtrip() {
+        let mut seed = 12345u32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+        };
+        let mut max_coarse = 0.0f32;
+        let mut max_fine = 0.0f32;
+        for _ in 0..20000 {
+            let q = [rnd(), rnd(), rnd(), rnd()];
+            let n = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+            if n < 1e-3 { continue; }
+            let q = q.map(|x| x / n);
+            let (coarse, refine) = encode_quat_oct101012_ext(q);
+            // decoders that ignore the refinement word see (almost always) the stock code
+            max_coarse = max_coarse.max(angle_between(q, decode_quat_oct101012(coarse)));
+            max_fine = max_fine.max(angle_between(q, decode_quat_oct101012_ext(coarse, refine)));
+            // a zero refinement word decodes like the stock code
+            assert_eq!(decode_quat_oct101012_ext(coarse, 0), decode_quat_oct101012(coarse));
+        }
+        assert!(max_fine < 4e-4, "refined error {max_fine}");
+        assert!(max_fine * 10.0 < max_coarse, "coarse {max_coarse} fine {max_fine}");
+    }
+
+    #[test]
+    fn ext_splat_opacity_keeps_refinement() {
+        let mut a = [0u32; 4];
+        let mut b = [0u32; 4];
+        let q = [0.1f32, -0.7, 0.3, 0.64];
+        let n = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let q = q.map(|x| x / n);
+        encode_ext_splat(&mut a, &mut b, [1.0, 2.0, 3.0], 0.5, [0.2, 0.3, 0.4], [0.01, 0.02, 0.03], q);
+        let before = decode_ext_splat_quat_ext(&a, &b);
+        encode_ext_splat_opacity(&mut a, 0.25);
+        assert_eq!(decode_ext_splat_quat_ext(&a, &b), before);
+        assert!((decode_ext_splat_opacity(&a) - 0.25).abs() < 1e-3);
+    }
 }

@@ -8,7 +8,7 @@ use spark_lib::{
     gsplat::GsplatArray,
     tsplat::{TsplatArray, Tsplat},
     splat_encode::{
-        decode_ext_rgb, decode_ext_splat_center, decode_ext_splat_opacity, decode_ext_splat_quat, decode_ext_splat_rgb, decode_ext_splat_scale, encode_ext_rgb, encode_ext_splat, encode_ext_splat_center, encode_ext_splat_opacity, encode_ext_splat_quat, encode_ext_splat_rgb, encode_ext_splat_rgba, encode_ext_splat_scale, encode_lod_tree, get_splat_tex_size
+        decode_ext_rgb, decode_ext_splat_center, decode_ext_splat_opacity, decode_ext_splat_quat_ext, decode_ext_splat_rgb, decode_ext_splat_scale, encode_ext_rgb, encode_ext_splat, encode_ext_splat_center, encode_ext_splat_opacity, encode_ext_splat_quat, encode_ext_splat_rgb, encode_ext_splat_rgba, encode_ext_splat_scale, encode_lod_tree, get_splat_tex_size
     },
 };
 use wasm_bindgen::JsValue;
@@ -538,7 +538,7 @@ impl SplatReceiver for ExtSplatsData {
         self.prepare_buffers(base, count);
         for i in 0..count {
             let i4 = i * 4;
-            encode_ext_splat_quat(&mut self.buffer_b[i4..i4 + 4], array::from_fn(|d| quat[i4 + d]));
+            encode_ext_splat_quat(&mut self.buffer_a[i4..i4 + 4], &mut self.buffer_b[i4..i4 + 4], array::from_fn(|d| quat[i4 + d]));
         }
         self.buffer_dirty = true;
     }
@@ -861,7 +861,7 @@ impl SplatGetter for ExtSplatsData {
                 out.scale[i3..i3 + 3].copy_from_slice(&scale);
             }
             if !out.quat.is_empty() {
-                let quat = decode_ext_splat_quat(buffer_b);
+                let quat = decode_ext_splat_quat_ext(buffer_a, buffer_b);
                 out.quat[i4..i4 + 4].copy_from_slice(&quat);
             }
         }
@@ -944,7 +944,7 @@ impl SplatGetter for ExtSplatsData {
         self.prepare_buffers(base, count);
         for i in 0..count {
             let i4 = i * 4;
-            let quat = decode_ext_splat_quat(&self.buffer_b[i4..i4 + 4]);
+            let quat = decode_ext_splat_quat_ext(&self.buffer_a[i4..i4 + 4], &self.buffer_b[i4..i4 + 4]);
             out[i4] = quat[0];
             out[i4 + 1] = quat[1];
             out[i4 + 2] = quat[2];
